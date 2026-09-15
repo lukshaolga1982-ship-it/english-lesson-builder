@@ -8,12 +8,12 @@ import {
   addDoc, collection, deleteDoc, doc, getDocs, limit, orderBy, query,
   serverTimestamp, updateDoc,
 } from 'firebase/firestore';
-import { httpsCallable } from 'firebase/functions';
-import { auth, db, functions, googleProvider } from './firebase';
+import { auth, db, googleProvider } from './firebase';
 import {
   competencies, defaultStages, extras, lessonTypes, literacies, speechActivities, textbookCatalog,
 } from './textbooks';
 import { exportLessonDocx } from './exportDocx';
+import { generateLesson, refineLessonStage } from './api';
 import './styles.css';
 
 const INITIAL = {
@@ -73,7 +73,7 @@ const demoLesson = (f) => ({
     duration: name === 'Физкультминутка' ? 2 : Math.max(2, Math.round((Number(f.duration) - 2) / Math.max(1, defaultStages[f.lessonType].length - 1))),
     teacher: name === 'Физкультминутка' ? 'Даёт короткие команды на английском языке и демонстрирует движения.' : 'Организует работу, даёт коммуникативную инструкцию на английском языке, при необходимости уточняет её по-русски.',
     students: name === 'Физкультминутка' ? 'Выполняют движения и повторяют языковые единицы.' : 'Выполняют задание индивидуально / в парах, сравнивают ответы и формулируют результат.',
-    activities: name === 'Физкультминутка' ? 'Stand up. Stretch up. Turn around. Find a partner and say one word from today’s topic.' : 'Пример задания появится после подключения Cloud Function Groq.',
+    activities: name === 'Физкультминутка' ? 'Stand up. Stretch up. Turn around. Find a partner and say one word from today’s topic.' : 'Пример задания появится после подключения Groq API.',
     forms: name === 'Физкультминутка' ? ['фронтальная'] : ['парная', 'индивидуальная'],
     competencies: ['Коммуникация'],
     literacy: ['Читательская'],
@@ -173,21 +173,21 @@ export default function App() {
       studentCount: Number(form.studentCount),
     };
     try {
-      const call = httpsCallable(functions, 'generateLesson', { timeout: 120000 });
-      const result = await call(payload);
-      setLesson(result.data.lesson);
-      setRemaining(result.data.remaining ?? null);
+      const result = await generateLesson(user, payload);
+      setLesson(result.lesson);
+      setRemaining(result.remaining ?? null);
       setLessonId(null);
-      await saveLesson(result.data.lesson, true);
+      await saveLesson(result.lesson, true);
       setStep(3);
     } catch (e) {
       console.error(e);
-      const msg = e?.message || '';
-      if (msg.includes('not-found') || msg.includes('internal') || msg.includes('unavailable')) {
-        setLesson(demoLesson(payload));
-        setNotice('Показан демонстрационный результат: Cloud Function ещё не развёрнута или Groq Secret не добавлен. После настройки Firebase генерация будет реальной.');
-        setStep(3);
-      } else setNotice(`Ошибка генерации: ${msg}`);
+      const msg = e?.message || 'Неизвестная ошибка';
+      if (e?.code === 'DAILY_LIMIT') {
+        setRemaining(0);
+        setNotice('Лимит: 5 полных генераций на сегодня уже использованы.');
+      } else {
+        setNotice(`Ошибка генерации: ${msg}`);
+      }
     } finally { setBusy(false); }
   }
 
@@ -195,10 +195,9 @@ export default function App() {
     if (!user || !lesson) return;
     setBusy(true); setNotice('');
     try {
-      const call = httpsCallable(functions, 'refineLesson', { timeout: 120000 });
-      const result = await call({ mode, stage: lesson.stages[index], lessonContext: { title: lesson.title, meta: lesson.meta }, form });
+      const result = await refineLessonStage(user, { mode, stage: lesson.stages[index], lessonContext: { title: lesson.title, meta: lesson.meta }, form });
       const next = structuredClone(lesson);
-      next.stages[index] = result.data.stage;
+      next.stages[index] = result.stage;
       setLesson(next);
       await saveLesson(next);
     } catch (e) { setNotice(`Не удалось изменить этап: ${e.message}`); }

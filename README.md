@@ -12,9 +12,9 @@
 - обязательная тематическая физкультминутка;
 - опциональное аудирование с текстом, заданиями и ключами;
 - Google Authentication;
-- генерация через Firebase Callable Function → Groq → Qwen 3.8 27B;
+- генерация через Cloudflare Worker → Groq → Qwen 3.8 27B;
 - fallback на GPT-OSS 120B;
-- 5 полных генераций в сутки на пользователя + 30 точечных доработок;
+- 5 полных генераций в сутки на пользователя + 40 точечных доработок;
 - редактирование результата, «интереснее / проще / сложнее», перегенерация этапа;
 - сохранение и история «Мои конспекты» в Firestore;
 - скачивание Word (.docx), Times New Roman 14, интервал 1;
@@ -51,26 +51,26 @@ firebase use english-lesson-builder
 firebase deploy --only firestore:rules
 ```
 
-## 4. Groq API key — НЕ добавлять в GitHub
+## 4. Groq API и Cloudflare Worker
 
-Ключ хранится только в Google Secret Manager и доступен только Cloud Function.
+Groq API key хранится только как **Secret** в Cloudflare Worker и не попадает в GitHub или браузер пользователя.
 
-```bash
-firebase functions:secrets:set GROQ_API_KEY
-```
+Worker уже создан по адресу:
 
-CLI попросит ввести ключ. Вставьте его в терминал.
+`https://proud-surf-1244.lukshaolga1982.workers.dev`
 
-Затем:
+Нужные bindings:
 
-```bash
-cd functions
-npm install
-cd ..
-firebase deploy --only functions
-```
+- Secret `GROQ_API_KEY`;
+- KV binding `USAGE_LIMITS`.
 
-> Для production-развёртывания Cloud Functions Firebase требует подключённый Blaze billing account. Секрет и функции имеют бесплатные квоты, но у проекта должен быть разрешён биллинг. Поставьте budget alerts в Google Cloud Billing.
+Проверка работоспособности Worker:
+
+`https://proud-surf-1244.lukshaolga1982.workers.dev/`
+
+Должно возвращаться `groqConfigured: true` и `kvConfigured: true`.
+
+Резервная копия серверного кода находится в файле `cloudflare-worker.js`.
 
 ## 5. GitHub Pages
 
