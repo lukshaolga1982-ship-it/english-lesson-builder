@@ -29,7 +29,7 @@ const labelPara = (label, value) => new Paragraph({
 const arrayText = (value) => Array.isArray(value) ? value.filter(Boolean).join('; ') : (value || '—');
 
 function stageTable(lesson) {
-  const header = ['Этап', 'Время', 'Деятельность учителя', 'Деятельность учащихся', 'Формы работы', 'Компетенции'];
+  const header = ['Этап', 'Время', 'Результат этапа', 'Деятельность учителя', 'Деятельность учащихся', 'Логический мостик'];
   const rows = [
     new TableRow({
       tableHeader: true,
@@ -38,10 +38,10 @@ function stageTable(lesson) {
     ...(lesson.stages || []).map((s) => new TableRow({ children: [
       new TableCell({ children: [para(s.name)] }),
       new TableCell({ children: [para(`${s.duration} мин`)] }),
+      new TableCell({ children: [para(s.stageResult || '—')] }),
       new TableCell({ children: [para(s.teacher)] }),
       new TableCell({ children: [para(s.students)] }),
-      new TableCell({ children: [para(arrayText(s.forms))] }),
-      new TableCell({ children: [para(arrayText(s.competencies))] }),
+      new TableCell({ children: [para(s.bridgeToNext || '—')] }),
     ] })),
   ];
   return new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows });
@@ -54,6 +54,8 @@ function detailedStages(lesson) {
       spacing: { line: 240, before: 160, after: 60 },
       children: [run(`${index + 1}. ${s.name} — ${s.duration} мин`, { bold: true })],
     }),
+    labelPara('Функция этапа', s.purpose),
+    labelPara('Результат этапа', s.stageResult),
     labelPara('Деятельность учителя', s.teacher),
     labelPara('Деятельность учащихся', s.students),
     labelPara('Задания / ход работы', s.activities),
@@ -62,6 +64,7 @@ function detailedStages(lesson) {
     labelPara('Функциональная грамотность', arrayText(s.literacy)),
     labelPara('Контроль / обратная связь', s.assessment),
     labelPara('Материалы', s.materials),
+    ...(s.bridgeToNext ? [labelPara('Логический мостик к следующему этапу', s.bridgeToNext)] : []),
   ]);
 }
 
@@ -82,6 +85,7 @@ export async function exportLessonDocx({ lesson, form, format }) {
     labelPara('Часть / страницы', `${form.part || '—'} / ${form.pages || '—'}`),
     para('', {}),
     labelPara('Цель', lesson.meta?.goal),
+    labelPara('Критерии успеха', arrayText(lesson.meta?.successCriteria)),
     labelPara('Образовательные задачи', arrayText(lesson.meta?.tasks?.educational)),
     labelPara('Развивающие задачи', arrayText(lesson.meta?.tasks?.developmental)),
     labelPara('Воспитательные задачи', arrayText(lesson.meta?.tasks?.upbringing)),
@@ -90,6 +94,7 @@ export async function exportLessonDocx({ lesson, form, format }) {
     labelPara('Формы работы', arrayText(lesson.meta?.forms)),
     labelPara('Методы', arrayText(lesson.meta?.methods)),
     labelPara('Языковой материал', arrayText(lesson.meta?.languageMaterial)),
+    ...(lesson.lessonLogic ? [labelPara('Сквозная логика урока', lesson.lessonLogic)] : []),
     para('', {}),
     new Paragraph({ heading: HeadingLevel.HEADING_1, children: [run('Ход урока', { bold: true })] }),
     ...(format === 'Таблица' ? [stageTable(lesson)] : detailedStages(lesson)),
