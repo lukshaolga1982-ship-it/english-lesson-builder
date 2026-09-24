@@ -75,7 +75,13 @@ async function verifyFirebaseToken(token) {
 
   if (!jwksResponse.ok) throw new Error("Не удалось получить ключи Firebase.");
   const jwks = await jwksResponse.json();
-  const jwk = jwks[header.kid];
+
+  // Google returns this endpoint in standard JWKS form: { keys: [...] }.
+  // Keep compatibility with a possible map-by-kid response as well.
+  const jwk = Array.isArray(jwks?.keys)
+    ? jwks.keys.find((key) => key.kid === header.kid)
+    : jwks?.[header.kid];
+
   if (!jwk) throw new Error("Ключ подписи Firebase не найден.");
 
   const cryptoKey = await crypto.subtle.importKey(
@@ -340,10 +346,11 @@ export default {
         }, 401);
       }
 
+      console.error("Firebase auth verification failed:", error);
       return jsonResponse(request, {
         ok: false,
         error: "INVALID_TOKEN",
-        message: "Не удалось проверить авторизацию Firebase.",
+        message: "Не удалось проверить авторизацию Firebase. Выйдите из аккаунта на сайте, войдите снова и повторите генерацию.",
       }, 401);
     }
 

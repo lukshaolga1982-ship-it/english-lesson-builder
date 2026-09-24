@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  BookOpen, Check, ChevronLeft, ChevronRight, Download, FileText, History,
+  BookOpen, Check, ChevronLeft, ChevronRight, Download, ExternalLink, FileText, History,
   Link2, LogIn, LogOut, RefreshCw, Save, Sparkles, WandSparkles, X, Zap,
 } from 'lucide-react';
 import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
@@ -52,6 +52,7 @@ const INITIAL = {
 };
 
 const STEPS = ['Основа урока', 'Методика', 'Параметры класса', 'Проверка'];
+const E_PADRUCHNIK_URL = 'https://e-padruchnik.adu.by/';
 
 function ChipGroup({ options, value, onChange, priorityNames = [] }) {
   const toggle = (item) => onChange(value.includes(item) ? value.filter((x) => x !== item) : [...value, item]);
@@ -275,7 +276,18 @@ export default function App() {
               <Field label="Продолжительность"><select value={form.duration} onChange={(e) => update('duration', Number(e.target.value))}><option value={35}>35 минут</option><option value={40}>40 минут</option><option value={45}>45 минут</option></select></Field>
             </div>
             <div className="grid two">
-              <Field label="Учебник" wide><select value={form.textbookId} onChange={(e) => update('textbookId', e.target.value)}>{books.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}</select></Field>
+              <Field label="Учебник" wide>
+                <select value={form.textbookId} onChange={(e) => update('textbookId', e.target.value)}>{books.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}</select>
+                <div className="textbook-resource-row">
+                  <div className="textbook-resource-copy">
+                    <b>Сверить страницы учебника</b>
+                    <span>{currentBook?.custom ? 'Откройте официальный каталог и найдите нужный учебник по названию или автору.' : `Откройте электронную версию и сравните указанные страницы перед генерацией. Для поиска: ${currentBook?.label || `${form.grade} класс`}`}</span>
+                  </div>
+                  <a className="secondary textbook-resource-link" href={E_PADRUCHNIK_URL} target="_blank" rel="noreferrer" title="Открыть официальный каталог электронных учебников">
+                    <BookOpen size={15}/> e-padruchnik <ExternalLink size={13}/>
+                  </a>
+                </div>
+              </Field>
               {currentBook?.custom && <Field label="Название / авторы учебника"><input value={form.customTextbook} onChange={(e) => update('customTextbook', e.target.value)} placeholder="Например: Английский язык, 10 класс…"/></Field>}
             </div>
             <div className="grid four">
