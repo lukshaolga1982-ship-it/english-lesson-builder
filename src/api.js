@@ -122,6 +122,12 @@ export function normalizeLesson(raw, form = {}) {
       languageMaterial: toArray(meta.languageMaterial || data.languageMaterial || form.languageMaterial),
     },
     lessonLogic: data.lessonLogic || '',
+    sourceGrounding: {
+      textbookUsed: Boolean(data.sourceGrounding?.textbookUsed),
+      pages: toArray(data.sourceGrounding?.pages).map((x) => String(x)),
+      references: toArray(data.sourceGrounding?.references),
+      summary: data.sourceGrounding?.summary || '',
+    },
     stages: rawStages.map(normalizeStage),
     creativeOptions: normalizeCreativeOptions(data.creativeOptions || data.alternatives || {}),
     methodicalCheck: {
@@ -157,6 +163,12 @@ function lessonJsonContract() {
       languageMaterial: ['string'],
     },
     lessonLogic: 'кратко опиши сквозную содержательную логику урока и кульминационную коммуникативную задачу',
+    sourceGrounding: {
+      textbookUsed: 'boolean — true только если в запросе передан фактический текст страниц',
+      pages: ['номера реально использованных страниц'],
+      references: ['конкретные элементы учебника: номер упражнения/заголовок/тип текста/лексика — только то, что явно видно в переданном тексте'],
+      summary: '2–4 предложения: как именно содержание выбранных страниц встроено в урок',
+    },
     stages: [{
       id: 'string',
       name: 'точно одно из enabledStages',
@@ -214,6 +226,7 @@ function variantContract() {
 export async function generateLesson(user, payload) {
   const methodology = buildMethodologyContext(payload);
   const contract = lessonJsonContract();
+  const { textbookContext = '', textbookSourceInfo = {}, ...lessonParams } = payload;
   contract.creativeOptions.opening = [variantContract(), variantContract(), variantContract()];
   contract.creativeOptions.movement = payload.physicalBreakMode === 'Не добавлять'
     ? []
@@ -224,7 +237,22 @@ export async function generateLesson(user, payload) {
 Сформируй полный методически грамотный план-конспект урока английского языка.
 
 ПАРАМЕТРЫ УРОКА:
-${JSON.stringify(payload, null, 2)}
+${JSON.stringify(lessonParams, null, 2)}
+
+ТЕКСТ ВЫБРАННЫХ СТРАНИЦ УЧЕБНИКА — ОСНОВНОЙ ИСТОЧНИК СОДЕРЖАНИЯ:
+${textbookContext || '[Текст страниц не передан]'}
+
+ИНФОРМАЦИЯ ОБ ИСТОЧНИКЕ:
+${JSON.stringify(textbookSourceInfo, null, 2)}
+
+ПРАВИЛА ОПОРЫ НА УЧЕБНИК:
+1. Если текст страниц передан, сначала проанализируй ЕГО, а уже потом проектируй урок.
+2. Используй содержание, тексты, диалоги, лексику, грамматические явления, формулировки заданий и упражнения с этих страниц как основу урока.
+3. Не заменяй материал учебника на полностью авторский набор заданий. Авторские задания можно добавлять только как логичное развитие материала учебника.
+4. Если в тексте явно видны номера упражнений, заголовки, вопросы или речевые образцы — ссылайся на них точно. Не придумывай номера упражнений, которых нет в источнике.
+5. Если на страницах есть текст для чтения/диалог/таблица/иллюстративная подпись, используй извлечённую из них информацию на последующих этапах и в речевой кульминации.
+6. Если выбранная учителем тема расходится с фактическим содержанием страниц, не игнорируй расхождение: укажи его в methodicalCheck.warnings и построй план вокруг реально переданного содержания настолько, насколько это возможно.
+7. sourceGrounding.textbookUsed = true только при наличии фактического текста страниц. В references перечисли 3–8 конкретных опор из источника.
 
 МЕТОДИЧЕСКОЕ ЯДРО (обязательные правила генерации):
 ${JSON.stringify(methodology, null, 2)}
@@ -258,6 +286,8 @@ ${JSON.stringify(methodology, null, 2)}
 - сумма duration строго равна ${Number(payload.duration)};
 - задания реалистичны для ${payload.grade} класса и уровня «${payload.level}»;
 - выбранные компетенции/грамотности проявляются в действиях учащихся;
+- если текст страниц передан, минимум половина содержательно значимых этапов реально использует материал этих страниц;
+- sourceGrounding подтверждает конкретно, что именно взято из учебника;
 - нет выдуманных утверждений о содержании страниц учебника, если сам текст страниц в запросе не передан.
 
 ВЕРНИ ТОЛЬКО ОДИН JSON-ОБЪЕКТ ТОЧНО ТАКОЙ СТРУКТУРЫ:
@@ -272,7 +302,7 @@ ${JSON.stringify(contract, null, 2)}
   };
 }
 
-export async function refineLessonStage(user, { mode, stage, previousStage, nextStage, lessonContext, form }) {
+export async function refineLessonStage(user, { mode, stage, previousStage, nextStage, lessonContext, form, textbookContext = '' }) {
   const modeText = {
     regenerate: 'Перегенерируй этот этап полностью, сохранив его место, функцию, длительность и связь с соседними этапами.',
     interesting: 'Сделай этот этап заметно интереснее и активнее, но не превращай его в случайную игру и не ломай логику урока.',
@@ -290,6 +320,11 @@ export async function refineLessonStage(user, { mode, stage, previousStage, next
 
 Контекст урока:
 ${JSON.stringify({ lessonContext, form, methodology }, null, 2)}
+
+Фактический текст выбранных страниц учебника (если есть):
+${textbookContext || '[не передан]'}
+
+Если текст учебника передан, не отрывай улучшенный этап от него и не заменяй фактическое содержание выдуманным материалом.
 
 Предыдущий этап:
 ${JSON.stringify(previousStage || null, null, 2)}

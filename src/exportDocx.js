@@ -94,6 +94,10 @@ export async function exportLessonDocx({ lesson, form, format }) {
     labelPara('Формы работы', arrayText(lesson.meta?.forms)),
     labelPara('Методы', arrayText(lesson.meta?.methods)),
     labelPara('Языковой материал', arrayText(lesson.meta?.languageMaterial)),
+    ...(lesson.sourceGrounding?.textbookUsed ? [
+      labelPara('Опора на учебник', lesson.sourceGrounding.summary || `Использованы страницы: ${arrayText(lesson.sourceGrounding.pages)}`),
+      labelPara('Конкретные опоры из учебника', arrayText(lesson.sourceGrounding.references)),
+    ] : []),
     ...(lesson.lessonLogic ? [labelPara('Сквозная логика урока', lesson.lessonLogic)] : []),
     para('', {}),
     new Paragraph({ heading: HeadingLevel.HEADING_1, children: [run('Ход урока', { bold: true })] }),

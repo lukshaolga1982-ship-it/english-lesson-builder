@@ -15,6 +15,7 @@ import {
 import { findStageIndexForVariant, isMovementStage, resolveEnabledStages } from './methodology';
 import { exportLessonDocx } from './exportDocx';
 import { generateLesson, refineLessonStage } from './api';
+import { loadTextbookPagesFromFirestore, manualTextbookContext, parsePageNumbers } from './textbookSource';
 import './styles.css';
 
 const INITIAL = {
@@ -100,6 +101,9 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [history, setHistory] = useState([]);
   const [remaining, setRemaining] = useState(null);
+  const [manualTextbookText, setManualTextbookText] = useState('');
+  const [textbookSourceStatus, setTextbookSourceStatus] = useState({ state: 'idle', message: '' });
+  const [activeTextbookContext, setActiveTextbookContext] = useState('');
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
   useEffect(() => {
@@ -116,6 +120,9 @@ export default function App() {
 
   const changeGrade = (grade) => {
     const first = textbookCatalog[grade]?.[0];
+    setManualTextbookText('');
+    setActiveTextbookContext('');
+    setTextbookSourceStatus({ state: 'idle', message: '' });
     setForm((f) => ({ ...f, grade, textbookId: first?.id || '', customTextbook: '' }));
   };
 
@@ -133,6 +140,59 @@ export default function App() {
   async function login() {
     try { await signInWithPopup(auth, googleProvider); }
     catch (e) { setNotice(`Не удалось войти: ${e.message}`); }
+  }
+
+  async function resolveTextbookSource({ strict = false } = {}) {
+    const requestedPages = parsePageNumbers(form.pages);
+
+    if (!requestedPages.length) {
+      setTextbookSourceStatus({ state: 'neutral', message: 'Страницы не указаны — урок будет строиться без опоры на конкретный разворот учебника.' });
+      setActiveTextbookContext('');
+      return { text: '', requestedPages: [], loadedPages: [], missingPages: [], source: 'none' };
+    }
+
+    if (manualTextbookText.trim()) {
+      const manual = manualTextbookContext(manualTextbookText, form.pages);
+      setTextbookSourceStatus({ state: 'ready', message: `Будет использован вставленный текст для стр. ${form.pages}.` });
+      setActiveTextbookContext(manual.text);
+      return manual;
+    }
+
+    if (!user) {
+      if (strict) throw new Error('Чтобы загрузить текст страниц из библиотеки, сначала войдите через Google.');
+      return { text: '', requestedPages, loadedPages: [], missingPages: requestedPages, source: 'firestore' };
+    }
+
+    setTextbookSourceStatus({ state: 'checking', message: 'Проверяю наличие текста выбранных страниц…' });
+    const loaded = await loadTextbookPagesFromFirestore(db, form.textbookId, form.pages);
+
+    if (loaded.text && loaded.missingPages.length === 0) {
+      setTextbookSourceStatus({ state: 'ready', message: `Текст найден: стр. ${loaded.loadedPages.join(', ')}. Генератор будет опираться на него.` });
+      setActiveTextbookContext(loaded.text);
+      return loaded;
+    }
+
+    const missingLabel = loaded.missingPages.length ? loaded.missingPages.join(', ') : form.pages;
+    setTextbookSourceStatus({
+      state: 'missing',
+      message: loaded.loadedPages.length
+        ? `Найдены не все страницы. Есть: ${loaded.loadedPages.join(', ')}; нет: ${missingLabel}.`
+        : `В библиотеке нет текста стр. ${missingLabel} для выбранного учебника.`,
+    });
+    setActiveTextbookContext('');
+
+    if (strict) {
+      throw new Error(`Текст указанных страниц учебника не найден (${missingLabel}). Номер страницы сам по себе не даёт модели доступа к учебнику. Вставьте текст страниц в поле на шаге 1 или загрузите эти страницы в Firestore.`);
+    }
+    return loaded;
+  }
+
+  async function checkTextbookSource() {
+    try {
+      await resolveTextbookSource({ strict: false });
+    } catch (error) {
+      setTextbookSourceStatus({ state: 'missing', message: error.message });
+    }
   }
 
   async function loadHistory() {
@@ -163,14 +223,22 @@ export default function App() {
     if (!user) { setNotice('Для генерации войдите через Google.'); return; }
     if (!form.topic.trim()) { setNotice('Укажите тему урока.'); setStep(0); return; }
     setBusy(true); setNotice('');
-    const payload = {
-      ...form,
-      textbookLabel: currentBook?.label || form.customTextbook,
-      enabledStages: effectiveStages,
-      duration: Number(form.duration),
-      studentCount: Number(form.studentCount),
-    };
     try {
+      const source = await resolveTextbookSource({ strict: Boolean(form.pages.trim()) });
+      const payload = {
+        ...form,
+        textbookLabel: currentBook?.label || form.customTextbook,
+        enabledStages: effectiveStages,
+        duration: Number(form.duration),
+        studentCount: Number(form.studentCount),
+        textbookContext: source.text,
+        textbookSourceInfo: {
+          source: source.source,
+          requestedPages: source.requestedPages,
+          loadedPages: source.loadedPages,
+          missingPages: source.missingPages,
+        },
+      };
       const result = await generateLesson(user, payload);
       setLesson(result.lesson);
       setRemaining(result.remaining ?? null);
@@ -201,6 +269,7 @@ export default function App() {
         nextStage: lesson.stages[index + 1] || null,
         lessonContext: { title: lesson.title, meta: lesson.meta, lessonLogic: lesson.lessonLogic },
         form,
+        textbookContext: activeTextbookContext,
       });
       const next = structuredClone(lesson);
       next.stages[index] = { ...result.stage, id: current.id, name: current.name, duration: current.duration };
@@ -277,7 +346,7 @@ export default function App() {
             </div>
             <div className="grid two">
               <Field label="Учебник" wide>
-                <select value={form.textbookId} onChange={(e) => update('textbookId', e.target.value)}>{books.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}</select>
+                <select value={form.textbookId} onChange={(e) => { update('textbookId', e.target.value); setManualTextbookText(''); setActiveTextbookContext(''); setTextbookSourceStatus({ state: 'idle', message: '' }); }}>{books.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}</select>
                 <div className="textbook-resource-row">
                   <div className="textbook-resource-copy">
                     <b>Сверить страницы учебника</b>
@@ -292,9 +361,21 @@ export default function App() {
             </div>
             <div className="grid four">
               <Field label="Часть"><input value={form.part} onChange={(e) => update('part', e.target.value)} placeholder="1"/></Field>
-              <Field label="Страницы"><input value={form.pages} onChange={(e) => update('pages', e.target.value)} placeholder="23–26"/></Field>
+              <Field label="Страницы"><input value={form.pages} onChange={(e) => { update('pages', e.target.value); setActiveTextbookContext(''); setTextbookSourceStatus({ state: 'idle', message: '' }); }} placeholder="23–26"/></Field>
               <Field label="Unit (по желанию)"><input value={form.unit} onChange={(e) => update('unit', e.target.value)} placeholder="Unit 1"/></Field>
               <Field label="Lesson (по желанию)"><input value={form.lesson} onChange={(e) => update('lesson', e.target.value)} placeholder="Lesson 4"/></Field>
+            </div>
+            <div className={`textbook-source-panel ${textbookSourceStatus.state || 'idle'}`}>
+              <div className="textbook-source-head">
+                <div><b>Текст страниц для генератора</b><span>Сам номер страницы не позволяет ИИ прочитать учебник. Перед генерацией сайт должен получить реальный текст.</span></div>
+                <button type="button" className="secondary" onClick={checkTextbookSource} disabled={!form.pages.trim() || textbookSourceStatus.state === 'checking'}>
+                  {textbookSourceStatus.state === 'checking' ? <RefreshCw size={14} className="spin"/> : <BookOpen size={14}/>} Проверить страницы
+                </button>
+              </div>
+              {textbookSourceStatus.message && <div className="textbook-source-status">{textbookSourceStatus.message}</div>}
+              <Field label="Если страниц нет в библиотеке — вставьте сюда текст выбранных страниц" hint="Можно скопировать текст из электронной версии учебника. Этот текст имеет приоритет над библиотекой Firestore." wide>
+                <textarea rows={5} value={manualTextbookText} onChange={(e) => { setManualTextbookText(e.target.value); setActiveTextbookContext(''); setTextbookSourceStatus({ state: e.target.value.trim() ? 'ready' : 'idle', message: e.target.value.trim() ? `Будет использован вставленный текст для стр. ${form.pages || 'указанных страниц'}.` : '' }); }} placeholder="Вставьте текст упражнений, диалогов, правил и заданий с выбранных страниц…"/>
+              </Field>
             </div>
             <Field label="Тема урока" wide hint={`В документе: ${titlePreview}`}><input className="large-input" value={form.topic} onChange={(e) => update('topic', e.target.value)} placeholder="Например: Mass Media"/></Field>
             <div className="grid two">
@@ -337,13 +418,14 @@ export default function App() {
               <Field label="Домашнее задание"><select value={form.homeworkMode} onChange={(e) => update('homeworkMode', e.target.value)}><option>Сгенерировать</option><option>Ввести самостоятельно</option></select></Field>
               {form.homeworkMode === 'Ввести самостоятельно' && <Field label="Текст домашнего задания"><input value={form.homework} onChange={(e) => update('homework', e.target.value)}/></Field>}
             </div>
-            <div className="info-box"><b>Учебник и страницы</b><p>Если страницы выбранного учебника загружены в библиотеку Firestore, модель может получить их текст через серверную интеграцию. Если текста страниц нет в запросе, генератору запрещено утверждать, что он видел конкретные упражнения учебника.</p></div>
+            <div className="info-box"><b>Учебник и страницы</b><p>Если указаны страницы, генерация теперь требует их фактический текст: из Firestore или из поля на шаге 1. Без текста сайт не будет создавать план «по страницам» наугад.</p></div>
           </>}
 
           {step === 3 && !lesson && <>
             <div className="section-head"><div><span>Шаг 4</span><h2>Проверка перед генерацией</h2></div><Sparkles/></div>
             <div className="summary-grid"><div><span>Тема</span><b>{titlePreview}</b></div><div><span>Класс</span><b>{form.grade}, {form.level.toLowerCase()}</b></div><div><span>Урок</span><b>{form.lessonType}</b></div><div><span>Время</span><b>{selectedStageMinutes} минут</b></div><div><span>Учащихся</span><b>{form.studentCount}</b></div><div><span>Этапов</span><b>{effectiveStages.length}</b></div></div>
             <div className="summary-long"><b>Компетенции</b><p>{form.competencies.join(', ') || 'Не выбраны'}</p><b>Функциональная грамотность</b><p>{form.literacies.join(', ') || 'Не выбрана'}</p><b>Дополнительно</b><p>{form.extras.join(', ') || 'Нет'}</p><b>Методическая логика</b><p>Цель → последовательная система упражнений → речевая кульминация → рефлексия по критериям успеха; между этапами — содержательные мостики.</p></div>
+            <div className={`source-summary ${textbookSourceStatus.state || 'idle'}`}><b>Опора на учебник</b><p>{form.pages ? (textbookSourceStatus.message || `Перед генерацией будут проверены стр. ${form.pages}.`) : 'Конкретные страницы не указаны.'}</p></div>
             <button className="generate" disabled={busy} onClick={generate}>{busy ? <RefreshCw className="spin"/> : <Sparkles/>}{busy ? 'Создаю и проверяю план…' : 'Создать план-конспект'}</button>
             {!user && <p className="signin-hint">Для генерации нужен вход через Google — так работают история и дневной лимит.</p>}
           </>}
@@ -358,6 +440,8 @@ export default function App() {
               <EditableArray label="Развивающие задачи" items={lesson.meta?.tasks?.developmental || []} onChange={(v) => setLesson({ ...lesson, meta: { ...lesson.meta, tasks: { ...lesson.meta.tasks, developmental: v } } })}/>
               <EditableArray label="Воспитательные задачи" items={lesson.meta?.tasks?.upbringing || []} onChange={(v) => setLesson({ ...lesson, meta: { ...lesson.meta, tasks: { ...lesson.meta.tasks, upbringing: v } } })}/>
             </div>
+
+            {lesson.sourceGrounding?.textbookUsed && <div className="source-grounding"><BookOpen size={18}/><div><b>Опора на учебник</b><p>{lesson.sourceGrounding.summary || `Использованы страницы: ${(lesson.sourceGrounding.pages || []).join(', ')}`}</p>{lesson.sourceGrounding.references?.length > 0 && <ul>{lesson.sourceGrounding.references.map((x, i)=><li key={i}>{x}</li>)}</ul>}</div></div>}
 
             {lesson.lessonLogic && <div className="logic-box"><Link2 size={18}/><div><b>Сквозная логика урока</b><p>{lesson.lessonLogic}</p></div></div>}
             {lesson.methodicalCheck?.summary && <div className="method-check"><div><b>Методическая самопроверка</b><p>{lesson.methodicalCheck.summary}</p></div><span>{lesson.methodicalCheck.timeTotal || selectedStageMinutes} мин</span>{lesson.methodicalCheck.warnings?.length > 0 && <ul>{lesson.methodicalCheck.warnings.map((x, i)=><li key={i}>{x}</li>)}</ul>}</div>}
@@ -398,6 +482,7 @@ export default function App() {
       const restoredForm = { ...INITIAL, ...item.form };
       if (item.form?.physicalMinute === false && !item.form?.physicalBreakMode) restoredForm.physicalBreakMode = 'Не добавлять';
       setForm(restoredForm);
+      setManualTextbookText(''); setActiveTextbookContext(''); setTextbookSourceStatus({ state: 'idle', message: '' });
       setStages(item.form?.enabledStages || defaultStages[item.form?.lessonType] || []);
       setLesson(item.lesson); setLessonId(item.id); setStep(3); setHistoryOpen(false);
     }}><b>{item.lesson?.title || item.form?.topic}</b><span>{item.form?.grade} класс · {item.form?.date || ''}</span></button><button className="delete" onClick={async()=>{await deleteDoc(doc(db,'users',user.uid,'lessons',item.id)); setHistory(history.filter(x=>x.id!==item.id));}}><X size={15}/></button></div>)}</aside></div>}
