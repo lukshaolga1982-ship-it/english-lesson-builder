@@ -1,7 +1,7 @@
 const FIREBASE_PROJECT_ID = "english-lesson-builder";
 const PRIMARY_MODEL = "qwen/qwen3.8-27b";
 const FALLBACK_MODEL = "openai/gpt-oss-120b";
-const VISION_FALLBACK_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
+const VISION_FALLBACK_MODEL = null;
 
 const ALLOWED_ORIGINS = new Set([
   "https://lukshaolga1982-ship-it.github.io",
@@ -456,23 +456,33 @@ function safeJsonParse(text) {
 }
 
 async function callGroq(env, prompt, systemPrompt) {
-  const models = [PRIMARY_MODEL, FALLBACK_MODEL];
+  const models = [PRIMARY_MODEL, FALLBACK_MODEL].filter(Boolean);
   let lastError = null;
   for (const model of models) {
     try {
+      const body = {
+        model,
+        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: prompt }],
+        temperature: 0.35,
+        max_completion_tokens: 5200,
+        response_format: { type: "json_object" },
+        service_tier: "auto",
+      };
+      if (model.startsWith("qwen/")) body.reasoning_effort = "none";
+
       const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
         headers: { "Authorization": `Bearer ${env.GROQ_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: prompt }],
-          temperature: 0.35,
-          max_completion_tokens: 12000,
-          response_format: { type: "json_object" },
-        }),
+        body: JSON.stringify(body),
       });
       const data = await response.json();
-      if (!response.ok) { lastError = new Error(data?.error?.message || `Groq вернул HTTP ${response.status} для ${model}`); continue; }
+      if (!response.ok) {
+        const message = data?.error?.message || `Groq вернул HTTP ${response.status} для ${model}`;
+        lastError = new Error(message);
+        lastError.status = response.status;
+        lastError.code = data?.error?.code || '';
+        continue;
+      }
       const content = data?.choices?.[0]?.message?.content;
       if (!content) { lastError = new Error(`Groq не вернул текст ответа для ${model}.`); continue; }
       return { model, result: safeJsonParse(content), usage: data.usage || null };
@@ -483,7 +493,7 @@ async function callGroq(env, prompt, systemPrompt) {
 
 
 async function callGroqVisionOcr(env, images) {
-  const models = [PRIMARY_MODEL, VISION_FALLBACK_MODEL];
+  const models = [PRIMARY_MODEL].filter(Boolean);
   const content = [{
     type: "text",
     text: `Ты выполняешь точное распознавание страниц школьного учебника английского языка.
@@ -513,7 +523,9 @@ async function callGroqVisionOcr(env, images) {
           model,
           messages: [{ role: "user", content }],
           temperature: 0.1,
-          max_completion_tokens: 9000,
+          max_completion_tokens: 5200,
+          service_tier: "auto",
+          reasoning_effort: "none",
           response_format: { type: "json_object" },
         }),
       });
@@ -602,7 +614,7 @@ async function handleGenerate(request, env, user) {
   }
   const body = await request.json();
   const prompt = normalizePrompt(body);
-  if (prompt.length > 180000) return jsonResponse(request, { ok: false, error: "PROMPT_TOO_LARGE", message: "Материал запроса слишком большой." }, 413);
+  if (prompt.length > 50000) return jsonResponse(request, { ok: false, error: "PROMPT_TOO_LARGE", message: "Материал запроса слишком большой." }, 413);
   const groq = await callGroq(env, prompt, LESSON_SYSTEM_PROMPT);
   const next = await incrementUsage(env, user.sub, "generate");
   return jsonResponse(request, { ok: true, ...groq, limit: FULL_DAILY_LIMIT, used: next, remaining: Math.max(0, FULL_DAILY_LIMIT - next) });
