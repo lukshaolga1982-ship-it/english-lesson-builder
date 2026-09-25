@@ -11,6 +11,83 @@ const ALLOWED_ORIGINS = new Set([
   "http://localhost:3000",
 ]);
 
+const E_PADRUCHNIK = "https://e-padruchnik.adu.by/";
+const ALLOWED_TEXTBOOK_HOSTS = new Set([
+  "e-padruchnik.adu.by",
+  "files.knihi.com",
+  "knihi.com",
+  "padruchnik.com",
+  "www.padruchnik.com",
+]);
+
+// Stable fallbacks are used only when the official portal cannot expose a direct PDF URL.
+// The official e-padruchnik catalog remains the primary source and the UI always links to it for comparison.
+const TEXTBOOK_SOURCES = {
+  "demchenko-5-2025": {
+    grade: 5,
+    year: 2025,
+    title: "Английский язык. 5 класс",
+    authors: ["Демченко", "Лапицкая", "Юхнель", "Романчук"],
+    partCount: 2,
+  },
+  "demchenko-6-2026": {
+    grade: 6,
+    year: 2026,
+    title: "Английский язык. 6 класс",
+    authors: ["Демченко", "Бушуева", "Юхнель", "Манешина", "Маслёнченко", "Рыбалко", "Лукша"],
+    partCount: 2,
+  },
+  "yuhnel-6-2021": {
+    grade: 6,
+    year: 2021,
+    title: "Английский язык. 6 класс",
+    authors: ["Юхнель", "Наумова", "Малиновская"],
+    partCount: 1,
+    mirrors: {
+      "1": "https://files.knihi.com/Knihi/skola/zvycajnyja/anhlijskaja_mova/anhlijskaja_mova.06kl.2021.rus.pdf.zip/anhlijskaja_mova.06kl.2021_v2.rus.pdf",
+    },
+  },
+  "yuhnel-7-2023": {
+    grade: 7,
+    year: 2023,
+    title: "Английский язык. 7 класс",
+    authors: ["Юхнель", "Демченко", "Наумова", "Романчук"],
+    partCount: 1,
+    mirrors: {
+      "1": "https://files.knihi.com/Knihi/skola/zvycajnyja/anhlijskaja_mova/anhlijskaja_mova.07kl.2023.rus.pdf.zip/anhlijskaja_mova.07kl.2023_v2.rus.pdf",
+    },
+  },
+  "lapitskaya-8-2021": {
+    grade: 8,
+    year: 2021,
+    title: "Английский язык. 8 класс",
+    authors: ["Лапицкая", "Демченко", "Калишевич", "Юхнель", "Волков", "Севрюкова"],
+    partCount: 1,
+    mirrors: {
+      "1": "https://files.knihi.com/Knihi/skola/zvycajnyja/anhlijskaja_mova/anhlijskaja_mova.08kl.2021.rus.pdf.zip/anhlijskaja_mova.08kl.2021_v2.rus.pdf",
+    },
+  },
+  "lapitskaya-9-2026": {
+    grade: 9,
+    year: 2025,
+    alternateYears: [2026],
+    title: "Английский язык. 9 класс",
+    authors: ["Лапицкая", "Демченко", "Юхнель", "Волков"],
+    partCount: 1,
+  },
+  "demchenko-11-2022": {
+    grade: 11,
+    year: 2022,
+    title: "Английский язык. 11 класс",
+    authors: ["Демченко", "Бушуева", "Севрюкова", "Лапицкая", "Романчук"],
+    partCount: 2,
+    mirrors: {
+      "1": "https://files.knihi.com/Knihi/skola/zvycajnyja/anhlijskaja_mova/anhlijskaja_mova.11kl.2022v.belrus.pdf.zip/anhlijskaja_mova.11kl.2022_1-v2.belrus.pdf",
+      "2": "https://files.knihi.com/Knihi/skola/zvycajnyja/anhlijskaja_mova/anhlijskaja_mova.11kl.2022v.belrus.pdf.zip/anhlijskaja_mova.11kl.2022_2-v2.belrus.pdf",
+    },
+  },
+};
+
 function corsHeaders(request) {
   const origin = request.headers.get("Origin");
   const allowed = origin && ALLOWED_ORIGINS.has(origin)
@@ -21,6 +98,7 @@ function corsHeaders(request) {
     "Access-Control-Allow-Origin": allowed,
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type",
+    "Access-Control-Expose-Headers": "X-Textbook-Source-Name,X-Textbook-Source-Url,X-Textbook-Source-Type",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   };
@@ -55,13 +133,10 @@ async function verifyFirebaseToken(token) {
   const header = decodeJwtPart(encodedHeader);
   const payload = decodeJwtPart(encodedPayload);
 
-  if (header.alg !== "RS256" || !header.kid) {
-    throw new Error("Неподдерживаемая подпись Firebase token.");
-  }
+  if (header.alg !== "RS256" || !header.kid) throw new Error("Неподдерживаемая подпись Firebase token.");
 
   const now = Math.floor(Date.now() / 1000);
   const expectedIssuer = `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`;
-
   if (payload.aud !== FIREBASE_PROJECT_ID) throw new Error("Неверная аудитория Firebase token.");
   if (payload.iss !== expectedIssuer) throw new Error("Неверный издатель Firebase token.");
   if (!payload.sub) throw new Error("В Firebase token отсутствует uid.");
@@ -72,16 +147,9 @@ async function verifyFirebaseToken(token) {
     "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com",
     { cf: { cacheTtl: 3600, cacheEverything: true } }
   );
-
   if (!jwksResponse.ok) throw new Error("Не удалось получить ключи Firebase.");
   const jwks = await jwksResponse.json();
-
-  // Google returns this endpoint in standard JWKS form: { keys: [...] }.
-  // Keep compatibility with a possible map-by-kid response as well.
-  const jwk = Array.isArray(jwks?.keys)
-    ? jwks.keys.find((key) => key.kid === header.kid)
-    : jwks?.[header.kid];
-
+  const jwk = Array.isArray(jwks?.keys) ? jwks.keys.find((key) => key.kid === header.kid) : jwks?.[header.kid];
   if (!jwk) throw new Error("Ключ подписи Firebase не найден.");
 
   const cryptoKey = await crypto.subtle.importKey(
@@ -94,14 +162,7 @@ async function verifyFirebaseToken(token) {
 
   const signedData = new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`);
   const signature = base64UrlToBytes(encodedSignature);
-
-  const verified = await crypto.subtle.verify(
-    "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    signature,
-    signedData
-  );
-
+  const verified = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", cryptoKey, signature, signedData);
   if (!verified) throw new Error("Подпись Firebase token не прошла проверку.");
   return payload;
 }
@@ -133,71 +194,289 @@ async function incrementUsage(env, uid, type) {
   return next;
 }
 
+function htmlDecode(value) {
+  return String(value || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function normalizeText(value) {
+  return htmlDecode(value)
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .replace(/ё/g, "е");
+}
+
+function absoluteUrl(value, base) {
+  try { return new URL(htmlDecode(value), base).href; } catch { return null; }
+}
+
+function extractUrls(html, base) {
+  const out = new Set();
+  const attrRe = /(?:href|src|data-href|data-url|data-file)\s*=\s*["']([^"']+)["']/gi;
+  let match;
+  while ((match = attrRe.exec(html))) {
+    const url = absoluteUrl(match[1], base);
+    if (url) out.add(url);
+  }
+  const pdfRe = /(?:https?:\/\/|\/)[^"'<>\s()]+\.pdf(?:\?[^"'<>\s()]*)?/gi;
+  while ((match = pdfRe.exec(html))) {
+    const url = absoluteUrl(match[0], base);
+    if (url) out.add(url);
+  }
+  return [...out];
+}
+
+function scoreHtmlBlock(block, meta, part) {
+  const text = normalizeText(block);
+  let score = 0;
+  if (text.includes("англий")) score += 6;
+  if (text.includes(String(meta.grade))) score += 4;
+  const years = [meta.year, ...(meta.alternateYears || [])].map(String);
+  if (years.some((year) => text.includes(year))) score += 5;
+  for (const author of meta.authors || []) {
+    if (text.includes(normalizeText(author))) score += 3;
+  }
+  if (meta.partCount > 1 && part) {
+    if (text.includes(`часть ${part}`) || text.includes(`ч. ${part}`) || text.includes(`часть&nbsp;${part}`)) score += 3;
+  }
+  return score;
+}
+
+async function looksLikePdf(url) {
+  try {
+    const parsed = new URL(url);
+    if (!ALLOWED_TEXTBOOK_HOSTS.has(parsed.hostname)) return false;
+    const response = await fetch(url, {
+      headers: { Range: "bytes=0-15", "User-Agent": "Mozilla/5.0" },
+      redirect: "follow",
+      cf: { cacheTtl: 86400 },
+    });
+    if (!response.ok && response.status !== 206) return false;
+    const type = (response.headers.get("content-type") || "").toLowerCase();
+    if (type.includes("application/pdf")) return true;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return bytes.length >= 4 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+  } catch {
+    return false;
+  }
+}
+
+async function resolvePdfFromHtmlPage(pageUrl, meta, part) {
+  try {
+    const response = await fetch(pageUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      redirect: "follow",
+      cf: { cacheTtl: 3600 },
+    });
+    if (!response.ok) return null;
+    const type = (response.headers.get("content-type") || "").toLowerCase();
+    if (type.includes("application/pdf")) return { url: response.url || pageUrl, type: "official" };
+    const html = await response.text();
+
+    // Prefer links inside rows/cards whose text matches class/year/authors.
+    const blocks = html.match(/<(?:tr|article|li|div)\b[^>]*>[\s\S]*?<\/(?:tr|article|li|div)>/gi) || [];
+    const ranked = blocks
+      .map((block) => ({ block, score: scoreHtmlBlock(block, meta, part) }))
+      .filter((x) => x.score >= 8)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 12);
+
+    const candidates = [];
+    for (const entry of ranked) candidates.push(...extractUrls(entry.block, response.url || pageUrl));
+    candidates.push(...extractUrls(html, response.url || pageUrl));
+
+    const seen = new Set();
+    for (const candidate of candidates) {
+      if (seen.has(candidate)) continue;
+      seen.add(candidate);
+      let host;
+      try { host = new URL(candidate).hostname; } catch { continue; }
+      if (!ALLOWED_TEXTBOOK_HOSTS.has(host)) continue;
+
+      if (/\.pdf(?:$|\?)/i.test(candidate) && await looksLikePdf(candidate)) {
+        return { url: candidate, type: host === "e-padruchnik.adu.by" ? "official" : "mirror" };
+      }
+
+      // Some catalog rows open a detail/download page rather than the PDF directly.
+      if (candidate.startsWith("http") && candidate !== pageUrl && !/\.(?:jpg|jpeg|png|gif|svg|css|js)(?:$|\?)/i.test(candidate)) {
+        try {
+          const detailResponse = await fetch(candidate, {
+            headers: { "User-Agent": "Mozilla/5.0" },
+            redirect: "follow",
+            cf: { cacheTtl: 3600 },
+          });
+          if (!detailResponse.ok) continue;
+          const detailType = (detailResponse.headers.get("content-type") || "").toLowerCase();
+          if (detailType.includes("application/pdf")) return { url: detailResponse.url || candidate, type: host === "e-padruchnik.adu.by" ? "official" : "mirror" };
+          const detailHtml = await detailResponse.text();
+          const pdfs = extractUrls(detailHtml, detailResponse.url || candidate).filter((u) => /\.pdf(?:$|\?)/i.test(u));
+          for (const pdf of pdfs.slice(0, 12)) {
+            if (await looksLikePdf(pdf)) return { url: pdf, type: new URL(pdf).hostname === "e-padruchnik.adu.by" ? "official" : "mirror" };
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function knihiCandidates(meta, part) {
+  const grade = String(meta.grade).padStart(2, "0");
+  const years = [meta.year, ...(meta.alternateYears || [])];
+  const out = [];
+  for (const year of years) {
+    const root = "https://files.knihi.com/Knihi/skola/zvycajnyja/anhlijskaja_mova/";
+    out.push(`${root}anhlijskaja_mova.${grade}kl.${year}.rus.pdf.zip/anhlijskaja_mova.${grade}kl.${year}_v2.rus.pdf`);
+    out.push(`${root}anhlijskaja_mova.${grade}kl.${year}.belrus.pdf.zip/anhlijskaja_mova.${grade}kl.${year}_v2.belrus.pdf`);
+    if (meta.partCount > 1) {
+      out.push(`${root}anhlijskaja_mova.${grade}kl.${year}v.belrus.pdf.zip/anhlijskaja_mova.${grade}kl.${year}_${part}-v2.belrus.pdf`);
+      out.push(`${root}anhlijskaja_mova.${grade}kl.${year}v.rus.pdf.zip/anhlijskaja_mova.${grade}kl.${year}_${part}-v2.rus.pdf`);
+      out.push(`${root}anhlijskaja_mova.${grade}kl.${year}.rus.pdf.zip/anhlijskaja_mova.${grade}kl.${year}_${part}-v2.rus.pdf`);
+      out.push(`${root}anhlijskaja_mova.${grade}kl.${year}.belrus.pdf.zip/anhlijskaja_mova.${grade}kl.${year}_${part}-v2.belrus.pdf`);
+    }
+  }
+  return [...new Set(out)];
+}
+
+async function resolveTextbookSource(env, bookId, requestedPart) {
+  const meta = TEXTBOOK_SOURCES[bookId];
+  if (!meta) throw new Error("Для этого учебника автоматический источник ещё не настроен.");
+  const part = meta.partCount > 1 ? String(requestedPart || "1") : "1";
+  if (!/^\d+$/.test(part) || Number(part) < 1 || Number(part) > (meta.partCount || 1)) {
+    throw new Error(`Для выбранного учебника укажите часть от 1 до ${meta.partCount || 1}.`);
+  }
+
+  const cacheKey = `textbook-source:${bookId}:part-${part}`;
+  if (env.USAGE_LIMITS) {
+    const cached = await env.USAGE_LIMITS.get(cacheKey, { type: "json" });
+    if (cached?.url && await looksLikePdf(cached.url)) return cached;
+  }
+
+  // 1) Official portal. Try common client/server search query names; also inspect the root page.
+  const searchText = `${meta.title} ${meta.authors?.[0] || ""} ${meta.year}`;
+  const officialPages = [
+    E_PADRUCHNIK,
+    `${E_PADRUCHNIK}?search=${encodeURIComponent(searchText)}`,
+    `${E_PADRUCHNIK}?q=${encodeURIComponent(searchText)}`,
+    `${E_PADRUCHNIK}?title=${encodeURIComponent("Английский язык")}&class=${meta.grade}&year=${meta.year}`,
+  ];
+  for (const page of officialPages) {
+    const resolved = await resolvePdfFromHtmlPage(page, meta, part);
+    if (resolved?.url && new URL(resolved.url).hostname === "e-padruchnik.adu.by") {
+      const value = { ...resolved, bookId, part, sourceName: "e-padruchnik.adu.by", catalogUrl: E_PADRUCHNIK };
+      if (env.USAGE_LIMITS) await env.USAGE_LIMITS.put(cacheKey, JSON.stringify(value), { expirationTtl: 604800 });
+      return value;
+    }
+  }
+
+  // 2) Curated stable mirror for older editions.
+  const mirror = meta.mirrors?.[part] || meta.mirrors?.["1"];
+  if (mirror && await looksLikePdf(mirror)) {
+    const value = { url: mirror, type: "mirror", bookId, part, sourceName: "files.knihi.com (зеркало электронной версии)", catalogUrl: E_PADRUCHNIK };
+    if (env.USAGE_LIMITS) await env.USAGE_LIMITS.put(cacheKey, JSON.stringify(value), { expirationTtl: 604800 });
+    return value;
+  }
+
+  // 3) Try predictable Knihi filenames for newer editions.
+  for (const candidate of knihiCandidates(meta, part)) {
+    if (await looksLikePdf(candidate)) {
+      const value = { url: candidate, type: "mirror", bookId, part, sourceName: "files.knihi.com (зеркало электронной версии)", catalogUrl: E_PADRUCHNIK };
+      if (env.USAGE_LIMITS) await env.USAGE_LIMITS.put(cacheKey, JSON.stringify(value), { expirationTtl: 604800 });
+      return value;
+    }
+  }
+
+  // 4) Last automatic fallback for older editions: public textbook mirror page.
+  // For 2025+ editions we intentionally do not guess from an older similarly named book.
+  if (Number(meta.year) < 2025) {
+    const mirrorPage = `https://padruchnik.com/${meta.grade}-klass/anglijskij-jazyk-${meta.grade}/`;
+    const mirrorResolved = await resolvePdfFromHtmlPage(mirrorPage, meta, part);
+    if (mirrorResolved?.url) {
+      const value = { ...mirrorResolved, type: "mirror", bookId, part, sourceName: "padruchnik.com (резервное зеркало)", catalogUrl: E_PADRUCHNIK };
+      if (env.USAGE_LIMITS) await env.USAGE_LIMITS.put(cacheKey, JSON.stringify(value), { expirationTtl: 604800 });
+      return value;
+    }
+  }
+
+  throw new Error("Не удалось автоматически получить PDF выбранного учебника. Откройте e-padruchnik для сверки или временно вставьте текст страниц вручную.");
+}
+
+async function handleTextbookSource(request, env) {
+  const body = await request.json();
+  const source = await resolveTextbookSource(env, String(body?.bookId || ""), String(body?.part || "1"));
+  return jsonResponse(request, { ok: true, source: { type: source.type, sourceName: source.sourceName, catalogUrl: source.catalogUrl, part: source.part } });
+}
+
+async function handleTextbookPdf(request, env) {
+  const body = await request.json();
+  const source = await resolveTextbookSource(env, String(body?.bookId || ""), String(body?.part || "1"));
+  const sourceUrl = new URL(source.url);
+  if (!ALLOWED_TEXTBOOK_HOSTS.has(sourceUrl.hostname)) throw new Error("Источник учебника не разрешён.");
+
+  const upstream = await fetch(source.url, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    redirect: "follow",
+    cf: { cacheTtl: 86400 },
+  });
+  if (!upstream.ok) throw new Error(`Источник учебника вернул HTTP ${upstream.status}.`);
+
+  const type = (upstream.headers.get("content-type") || "").toLowerCase();
+  if (!type.includes("pdf") && !/\.pdf(?:$|\?)/i.test(upstream.url || source.url)) {
+    throw new Error("Источник не вернул PDF-файл.");
+  }
+
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/pdf",
+      "Cache-Control": "private, max-age=3600",
+      "X-Textbook-Source-Name": encodeURIComponent(source.sourceName || "Источник учебника"),
+      "X-Textbook-Source-Url": source.url,
+      "X-Textbook-Source-Type": source.type || "mirror",
+      ...corsHeaders(request),
+    },
+  });
+}
+
 function normalizePrompt(body) {
   if (typeof body?.prompt === "string" && body.prompt.trim()) return body.prompt.trim();
-  if (body?.lesson && typeof body.lesson === "object") {
-    return JSON.stringify(body.lesson, null, 2);
-  }
+  if (body?.lesson && typeof body.lesson === "object") return JSON.stringify(body.lesson, null, 2);
   throw new Error("В запросе отсутствует prompt.");
 }
 
 function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return text;
-  }
+  try { return JSON.parse(text); } catch { return text; }
 }
 
 async function callGroq(env, prompt, systemPrompt) {
   const models = [PRIMARY_MODEL, FALLBACK_MODEL];
   let lastError = null;
-
   for (const model of models) {
     try {
       const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
-        headers: {
-          "Authorization": `Bearer ${env.GROQ_API_KEY}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Authorization": `Bearer ${env.GROQ_API_KEY}`, "Content-Type": "application/json" },
         body: JSON.stringify({
           model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: prompt },
-          ],
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: prompt }],
           temperature: 0.35,
           max_completion_tokens: 12000,
           response_format: { type: "json_object" },
         }),
       });
-
       const data = await response.json();
-
-      if (!response.ok) {
-        lastError = new Error(
-          data?.error?.message || `Groq вернул HTTP ${response.status} для ${model}`
-        );
-        continue;
-      }
-
+      if (!response.ok) { lastError = new Error(data?.error?.message || `Groq вернул HTTP ${response.status} для ${model}`); continue; }
       const content = data?.choices?.[0]?.message?.content;
-      if (!content) {
-        lastError = new Error(`Groq не вернул текст ответа для ${model}.`);
-        continue;
-      }
-
-      return {
-        model,
-        result: safeJsonParse(content),
-        usage: data.usage || null,
-      };
-    } catch (error) {
-      lastError = error;
-    }
+      if (!content) { lastError = new Error(`Groq не вернул текст ответа для ${model}.`); continue; }
+      return { model, result: safeJsonParse(content), usage: data.usage || null };
+    } catch (error) { lastError = error; }
   }
-
   throw lastError || new Error("Не удалось получить ответ от Groq.");
 }
 
@@ -220,7 +499,9 @@ const LESSON_SYSTEM_PROMPT = `
 - двигательная пауза, если она включена, должна реально менять позу/движение, занимать 1–3 минуты и быть возрастно уместной; для 9–11 классов избегай инфантильных форм;
 - рефлексия возвращает к цели и критериям успеха, фиксирует прогресс и трудности;
 - если запрошено аудирование, включай текст для озвучивания, задания и ответы;
-- если даны страницы учебника, опирайся только на переданное содержание страниц и не выдумывай упражнения, которых там нет;
+- если в запросе передан textbookContext, это главный содержательный источник для работы с указанными страницами: используй реальные тексты, упражнения, лексику и грамматику из него;
+- не придумывай номера или содержание упражнений, которых нет в textbookContext;
+- авторские задания допустимы только как развитие материала учебника и должны быть явно отличимы от упражнений учебника;
 - для всех проверяемых заданий добавляй ключи/образцы ответов;
 - время всех этапов в сумме должно соответствовать продолжительности урока;
 - пользовательский prompt содержит дополнительное методическое ядро и точный JSON-контракт — соблюдай их.
@@ -229,86 +510,44 @@ const LESSON_SYSTEM_PROMPT = `
 `;
 
 const REFINE_SYSTEM_PROMPT = `
-Ты редактируешь отдельный фрагмент плана-конспекта урока английского языка для школы
-Республики Беларусь. Сохраняй тему, возраст, уровень, длительность и методическую функцию исходного этапа.
-Учитывай соседние этапы. При изменении не ломай сквозную содержательную и языковую логику.
-bridgeToNext должен быть содержательным: конкретный результат текущего этапа → вопрос/дефицит → необходимость следующего действия.
-Выполни указанное пользователем изменение и верни ТОЛЬКО валидный JSON-объект без markdown.
+Ты редактируешь отдельный фрагмент плана-конспекта урока английского языка для школы Республики Беларусь.
+Сохраняй тему, возраст, уровень, длительность и методическую функцию исходного этапа. Учитывай соседние этапы.
+При изменении не ломай сквозную содержательную и языковую логику. bridgeToNext должен быть содержательным:
+конкретный результат текущего этапа → вопрос/дефицит → необходимость следующего действия.
+Если передан текст учебника, не выдумывай содержание отсутствующих упражнений.
+Верни ТОЛЬКО валидный JSON-объект без markdown.
 `;
 
 async function handleGenerate(request, env, user) {
   const FULL_DAILY_LIMIT = 5;
   const used = await getUsage(env, user.sub, "generate");
-
   if (used >= FULL_DAILY_LIMIT) {
-    return jsonResponse(request, {
-      ok: false,
-      error: "DAILY_LIMIT",
-      message: "Лимит полных генераций на сегодня исчерпан.",
-      limit: FULL_DAILY_LIMIT,
-      used,
-      remaining: 0,
-    }, 429);
+    return jsonResponse(request, { ok: false, error: "DAILY_LIMIT", message: "Лимит полных генераций на сегодня исчерпан.", limit: FULL_DAILY_LIMIT, used, remaining: 0 }, 429);
   }
-
   const body = await request.json();
   const prompt = normalizePrompt(body);
-
-  if (prompt.length > 180000) {
-    return jsonResponse(request, {
-      ok: false,
-      error: "PROMPT_TOO_LARGE",
-      message: "Материал запроса слишком большой.",
-    }, 413);
-  }
-
+  if (prompt.length > 180000) return jsonResponse(request, { ok: false, error: "PROMPT_TOO_LARGE", message: "Материал запроса слишком большой." }, 413);
   const groq = await callGroq(env, prompt, LESSON_SYSTEM_PROMPT);
   const next = await incrementUsage(env, user.sub, "generate");
-
-  return jsonResponse(request, {
-    ok: true,
-    ...groq,
-    limit: FULL_DAILY_LIMIT,
-    used: next,
-    remaining: Math.max(0, FULL_DAILY_LIMIT - next),
-  });
+  return jsonResponse(request, { ok: true, ...groq, limit: FULL_DAILY_LIMIT, used: next, remaining: Math.max(0, FULL_DAILY_LIMIT - next) });
 }
 
 async function handleRefine(request, env, user) {
   const REFINE_DAILY_LIMIT = 40;
   const used = await getUsage(env, user.sub, "refine");
-
   if (used >= REFINE_DAILY_LIMIT) {
-    return jsonResponse(request, {
-      ok: false,
-      error: "REFINE_LIMIT",
-      message: "Лимит точечных изменений на сегодня исчерпан.",
-      limit: REFINE_DAILY_LIMIT,
-      used,
-      remaining: 0,
-    }, 429);
+    return jsonResponse(request, { ok: false, error: "REFINE_LIMIT", message: "Лимит точечных изменений на сегодня исчерпан.", limit: REFINE_DAILY_LIMIT, used, remaining: 0 }, 429);
   }
-
   const body = await request.json();
   const prompt = normalizePrompt(body);
   const groq = await callGroq(env, prompt, REFINE_SYSTEM_PROMPT);
   const next = await incrementUsage(env, user.sub, "refine");
-
-  return jsonResponse(request, {
-    ok: true,
-    ...groq,
-    limit: REFINE_DAILY_LIMIT,
-    used: next,
-    remaining: Math.max(0, REFINE_DAILY_LIMIT - next),
-  });
+  return jsonResponse(request, { ok: true, ...groq, limit: REFINE_DAILY_LIMIT, used: next, remaining: Math.max(0, REFINE_DAILY_LIMIT - next) });
 }
 
 export default {
   async fetch(request, env) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(request) });
-    }
-
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
     const url = new URL(request.url);
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
@@ -317,55 +556,34 @@ export default {
         service: "Smart Lesson API",
         groqConfigured: Boolean(env.GROQ_API_KEY),
         kvConfigured: Boolean(env.USAGE_LIMITS),
+        automaticTextbooks: Object.keys(TEXTBOOK_SOURCES),
         primaryModel: PRIMARY_MODEL,
         fallbackModel: FALLBACK_MODEL,
       });
     }
 
-    if (request.method !== "POST") {
-      return jsonResponse(request, { ok: false, error: "METHOD_NOT_ALLOWED" }, 405);
-    }
-
-    if (!env.GROQ_API_KEY) {
-      return jsonResponse(request, {
-        ok: false,
-        error: "GROQ_NOT_CONFIGURED",
-        message: "В Worker не найден секрет GROQ_API_KEY.",
-      }, 500);
-    }
+    if (request.method !== "POST") return jsonResponse(request, { ok: false, error: "METHOD_NOT_ALLOWED" }, 405);
 
     let user;
     try {
       user = await requireUser(request);
     } catch (error) {
-      if (error?.message === "AUTH_REQUIRED") {
-        return jsonResponse(request, {
-          ok: false,
-          error: "AUTH_REQUIRED",
-          message: "Необходимо войти через Google.",
-        }, 401);
-      }
-
+      if (error?.message === "AUTH_REQUIRED") return jsonResponse(request, { ok: false, error: "AUTH_REQUIRED", message: "Необходимо войти через Google." }, 401);
       console.error("Firebase auth verification failed:", error);
-      return jsonResponse(request, {
-        ok: false,
-        error: "INVALID_TOKEN",
-        message: "Не удалось проверить авторизацию Firebase. Выйдите из аккаунта на сайте, войдите снова и повторите генерацию.",
-      }, 401);
+      return jsonResponse(request, { ok: false, error: "INVALID_TOKEN", message: "Не удалось проверить авторизацию Firebase. Выйдите из аккаунта на сайте, войдите снова и повторите действие." }, 401);
     }
 
     try {
+      if (url.pathname === "/textbook-source") return await handleTextbookSource(request, env, user);
+      if (url.pathname === "/textbook-pdf") return await handleTextbookPdf(request, env, user);
+
+      if (!env.GROQ_API_KEY) return jsonResponse(request, { ok: false, error: "GROQ_NOT_CONFIGURED", message: "В Worker не найден секрет GROQ_API_KEY." }, 500);
       if (url.pathname === "/generate") return await handleGenerate(request, env, user);
       if (url.pathname === "/refine") return await handleRefine(request, env, user);
       return jsonResponse(request, { ok: false, error: "NOT_FOUND" }, 404);
     } catch (error) {
       console.error("Smart Lesson API error:", error);
-
-      return jsonResponse(request, {
-        ok: false,
-        error: "SERVER_ERROR",
-        message: error?.message || "Неизвестная ошибка сервера.",
-      }, 500);
+      return jsonResponse(request, { ok: false, error: "SERVER_ERROR", message: error?.message || "Неизвестная ошибка сервера." }, 500);
     }
   },
 };

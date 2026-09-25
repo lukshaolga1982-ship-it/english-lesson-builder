@@ -2,12 +2,23 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
+
     match /users/{userId} {
       allow read, write: if signedIn() && request.auth.uid == userId;
+
       match /lessons/{lessonId} {
         allow read, create, update, delete: if signedIn() && request.auth.uid == userId;
       }
+
+      // Автоматически извлечённые страницы учебников кэшируются только внутри
+      // личного пространства пользователя. Другой пользователь не может их менять.
+      match /textbookCache/{cacheId} {
+        allow read, create, update, delete: if signedIn() && request.auth.uid == userId;
+      }
     }
+
+    // Общая библиотека остаётся только для чтения. Её можно заполнить позже
+    // администраторским импортом, но для автоматического режима это уже не обязательно.
     match /textbooks/{bookId} {
       allow read: if signedIn();
       allow write: if false;
@@ -16,6 +27,7 @@ service cloud.firestore {
         allow write: if false;
       }
     }
+
     match /usage/{uid}/{document=**} {
       allow read, write: if false;
     }

@@ -15,7 +15,7 @@ import {
 import { findStageIndexForVariant, isMovementStage, resolveEnabledStages } from './methodology';
 import { exportLessonDocx } from './exportDocx';
 import { generateLesson, refineLessonStage } from './api';
-import { loadTextbookPagesFromFirestore, manualTextbookContext, parsePageNumbers } from './textbookSource';
+import { manualTextbookContext, obtainTextbookPagesAutomatically, parsePageNumbers } from './textbookSource';
 import './styles.css';
 
 const INITIAL = {
@@ -153,38 +153,52 @@ export default function App() {
 
     if (manualTextbookText.trim()) {
       const manual = manualTextbookContext(manualTextbookText, form.pages);
-      setTextbookSourceStatus({ state: 'ready', message: `Будет использован вставленный текст для стр. ${form.pages}.` });
+      setTextbookSourceStatus({ state: 'ready', message: `Используется текст, вставленный вручную, для стр. ${form.pages}.` });
       setActiveTextbookContext(manual.text);
       return manual;
     }
 
+    if (currentBook?.custom) {
+      const message = 'Для учебника, указанного вручную, автоматическое получение страниц пока недоступно. Откройте e-padruchnik и вставьте текст нужных страниц в резервное поле ниже.';
+      setTextbookSourceStatus({ state: 'missing', message });
+      if (strict) throw new Error(message);
+      return { text: '', requestedPages, loadedPages: [], missingPages: requestedPages, source: 'custom' };
+    }
+
     if (!user) {
-      if (strict) throw new Error('Чтобы загрузить текст страниц из библиотеки, сначала войдите через Google.');
-      return { text: '', requestedPages, loadedPages: [], missingPages: requestedPages, source: 'firestore' };
+      const message = 'Чтобы получить страницы автоматически, сначала войдите через Google.';
+      setTextbookSourceStatus({ state: 'missing', message });
+      if (strict) throw new Error(message);
+      return { text: '', requestedPages, loadedPages: [], missingPages: requestedPages, source: 'automatic' };
     }
 
-    setTextbookSourceStatus({ state: 'checking', message: 'Проверяю наличие текста выбранных страниц…' });
-    const loaded = await loadTextbookPagesFromFirestore(db, form.textbookId, form.pages);
+    setTextbookSourceStatus({ state: 'checking', message: 'Проверяю кэш и получаю страницы учебника автоматически…' });
+    try {
+      const loaded = await obtainTextbookPagesAutomatically({
+        db,
+        user,
+        textbookId: form.textbookId,
+        part: form.part || '1',
+        pagesString: form.pages,
+        onProgress: (message) => setTextbookSourceStatus({ state: 'checking', message }),
+      });
 
-    if (loaded.text && loaded.missingPages.length === 0) {
-      setTextbookSourceStatus({ state: 'ready', message: `Текст найден: стр. ${loaded.loadedPages.join(', ')}. Генератор будет опираться на него.` });
-      setActiveTextbookContext(loaded.text);
-      return loaded;
+      if (loaded.text && loaded.missingPages.length === 0) {
+        const sourceLabel = loaded.sourceName ? ` Источник: ${loaded.sourceName}.` : '';
+        const cacheLabel = loaded.source === 'cache' ? ' Страницы уже были сохранены — повторная загрузка не потребовалась.' : ' Текст сохранён в вашем кэше Firestore для следующих уроков.';
+        setTextbookSourceStatus({ state: 'ready', message: `Готово: стр. ${loaded.loadedPages.join(', ')}.${sourceLabel}${cacheLabel}` });
+        setActiveTextbookContext(loaded.text);
+        return loaded;
+      }
+
+      throw new Error(`Не удалось получить стр. ${loaded.missingPages.join(', ') || form.pages}.`);
+    } catch (error) {
+      setActiveTextbookContext('');
+      const message = error?.message || 'Не удалось автоматически получить страницы учебника.';
+      setTextbookSourceStatus({ state: 'missing', message });
+      if (strict) throw error;
+      return { text: '', requestedPages, loadedPages: [], missingPages: requestedPages, source: 'automatic' };
     }
-
-    const missingLabel = loaded.missingPages.length ? loaded.missingPages.join(', ') : form.pages;
-    setTextbookSourceStatus({
-      state: 'missing',
-      message: loaded.loadedPages.length
-        ? `Найдены не все страницы. Есть: ${loaded.loadedPages.join(', ')}; нет: ${missingLabel}.`
-        : `В библиотеке нет текста стр. ${missingLabel} для выбранного учебника.`,
-    });
-    setActiveTextbookContext('');
-
-    if (strict) {
-      throw new Error(`Текст указанных страниц учебника не найден (${missingLabel}). Номер страницы сам по себе не даёт модели доступа к учебнику. Вставьте текст страниц в поле на шаге 1 или загрузите эти страницы в Firestore.`);
-    }
-    return loaded;
   }
 
   async function checkTextbookSource() {
@@ -234,6 +248,9 @@ export default function App() {
         textbookContext: source.text,
         textbookSourceInfo: {
           source: source.source,
+          sourceName: source.sourceName || '',
+          sourceType: source.sourceType || '',
+          sourceUrl: source.sourceUrl || '',
           requestedPages: source.requestedPages,
           loadedPages: source.loadedPages,
           missingPages: source.missingPages,
@@ -367,13 +384,13 @@ export default function App() {
             </div>
             <div className={`textbook-source-panel ${textbookSourceStatus.state || 'idle'}`}>
               <div className="textbook-source-head">
-                <div><b>Текст страниц для генератора</b><span>Сам номер страницы не позволяет ИИ прочитать учебник. Перед генерацией сайт должен получить реальный текст.</span></div>
-                <button type="button" className="secondary" onClick={checkTextbookSource} disabled={!form.pages.trim() || textbookSourceStatus.state === 'checking'}>
-                  {textbookSourceStatus.state === 'checking' ? <RefreshCw size={14} className="spin"/> : <BookOpen size={14}/>} Проверить страницы
+                <div><b>Страницы учебника</b><span>Сайт сам попробует получить PDF, прочитать указанные страницы и сохранить их в вашем кэше. Вручную скачивать учебник не нужно.</span></div>
+                <button type="button" className="secondary" onClick={checkTextbookSource} disabled={!form.pages.trim() || textbookSourceStatus.state === 'checking' || currentBook?.custom}>
+                  {textbookSourceStatus.state === 'checking' ? <RefreshCw size={14} className="spin"/> : <BookOpen size={14}/>} Получить страницы
                 </button>
               </div>
               {textbookSourceStatus.message && <div className="textbook-source-status">{textbookSourceStatus.message}</div>}
-              <Field label="Если страниц нет в библиотеке — вставьте сюда текст выбранных страниц" hint="Можно скопировать текст из электронной версии учебника. Этот текст имеет приоритет над библиотекой Firestore." wide>
+              <Field label="Резервный вариант — вставить текст вручную" hint="Нужен только если автоматическое получение конкретного издания временно не сработало. Вставленный текст всегда имеет приоритет." wide>
                 <textarea rows={5} value={manualTextbookText} onChange={(e) => { setManualTextbookText(e.target.value); setActiveTextbookContext(''); setTextbookSourceStatus({ state: e.target.value.trim() ? 'ready' : 'idle', message: e.target.value.trim() ? `Будет использован вставленный текст для стр. ${form.pages || 'указанных страниц'}.` : '' }); }} placeholder="Вставьте текст упражнений, диалогов, правил и заданий с выбранных страниц…"/>
               </Field>
             </div>
