@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-  BookOpen, Check, ChevronLeft, ChevronRight, Download, ExternalLink, FileText, History,
-  Link2, LogIn, LogOut, RefreshCw, Save, Sparkles, WandSparkles, X, Zap,
+  BookOpen, Camera, Check, ChevronLeft, ChevronRight, Download, ExternalLink, FileText, FileUp, History,
+  ImagePlus, Link2, LogIn, LogOut, RefreshCw, Save, Sparkles, Upload, WandSparkles, X, Zap,
 } from 'lucide-react';
 import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
 import {
@@ -15,7 +15,10 @@ import {
 import { findStageIndexForVariant, isMovementStage, resolveEnabledStages } from './methodology';
 import { exportLessonDocx } from './exportDocx';
 import { generateLesson, refineLessonStage } from './api';
-import { manualTextbookContext, obtainTextbookPagesAutomatically, parsePageNumbers } from './textbookSource';
+import {
+  buildTextbookCacheId, loadTextbookPagesFromFirestore, manualTextbookContext,
+  obtainTextbookPagesAutomatically, obtainTextbookPagesFromImages, obtainTextbookPagesFromUploadedPdf, parsePageNumbers,
+} from './textbookSource';
 import './styles.css';
 
 const INITIAL = {
@@ -104,6 +107,9 @@ export default function App() {
   const [manualTextbookText, setManualTextbookText] = useState('');
   const [textbookSourceStatus, setTextbookSourceStatus] = useState({ state: 'idle', message: '' });
   const [activeTextbookContext, setActiveTextbookContext] = useState('');
+  const [uploadedPageImages, setUploadedPageImages] = useState([]);
+  const [uploadedPdfFile, setUploadedPdfFile] = useState(null);
+  const [uploadedTextbookSource, setUploadedTextbookSource] = useState(null);
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
   useEffect(() => {
@@ -115,13 +121,24 @@ export default function App() {
   const titlePreview = `${form.topic || 'Тема урока'}${form.leadingActivity ? `. ${form.leadingActivity}` : ''}`;
   const selectedStageMinutes = useMemo(() => Number(form.duration), [form.duration]);
   const effectiveStages = useMemo(() => resolveEnabledStages(stages, form), [stages, form.physicalBreakMode]);
+  const textbookCacheId = useMemo(() => buildTextbookCacheId(form.textbookId, form.customTextbook || currentBook?.label || ''), [form.textbookId, form.customTextbook, currentBook?.label]);
+  const sourceSignature = `${textbookCacheId}|${form.part || '1'}|${String(form.pages || '').trim()}`;
 
   const update = (key, value) => setForm((f) => ({ ...f, [key]: value }));
+
+  const clearProcessedTextbookSource = () => {
+    setUploadedTextbookSource(null);
+    setActiveTextbookContext('');
+    setTextbookSourceStatus({ state: 'idle', message: '' });
+  };
 
   const changeGrade = (grade) => {
     const first = textbookCatalog[grade]?.[0];
     setManualTextbookText('');
     setActiveTextbookContext('');
+    setUploadedTextbookSource(null);
+    setUploadedPageImages([]);
+    setUploadedPdfFile(null);
     setTextbookSourceStatus({ state: 'idle', message: '' });
     setForm((f) => ({ ...f, grade, textbookId: first?.id || '', customTextbook: '' }));
   };
@@ -158,8 +175,24 @@ export default function App() {
       return manual;
     }
 
+    if (uploadedTextbookSource?.signature === sourceSignature && uploadedTextbookSource?.text) {
+      setTextbookSourceStatus({ state: 'ready', message: uploadedTextbookSource.message || `Используется загруженный материал для стр. ${form.pages}.` });
+      setActiveTextbookContext(uploadedTextbookSource.text);
+      return uploadedTextbookSource;
+    }
+
+    if (user) {
+      const cached = await loadTextbookPagesFromFirestore(db, textbookCacheId, form.pages, { uid: user.uid, part: form.part || '1' });
+      if (cached.text && cached.missingPages.length === 0) {
+        const ready = { ...cached, source: 'cache', sourceName: cached.sourceName || 'Сохранённые страницы' };
+        setTextbookSourceStatus({ state: 'ready', message: `Стр. ${ready.loadedPages.join(', ')} уже сохранены в вашем кэше — можно генерировать урок.` });
+        setActiveTextbookContext(ready.text);
+        return ready;
+      }
+    }
+
     if (currentBook?.custom) {
-      const message = 'Для учебника, указанного вручную, автоматическое получение страниц пока недоступно. Откройте e-padruchnik и вставьте текст нужных страниц в резервное поле ниже.';
+      const message = 'Для этого учебника загрузите PDF целиком или фото нужных страниц ниже. После распознавания текст сохранится в вашем личном кэше.';
       setTextbookSourceStatus({ state: 'missing', message });
       if (strict) throw new Error(message);
       return { text: '', requestedPages, loadedPages: [], missingPages: requestedPages, source: 'custom' };
@@ -206,6 +239,50 @@ export default function App() {
       await resolveTextbookSource({ strict: false });
     } catch (error) {
       setTextbookSourceStatus({ state: 'missing', message: error.message });
+    }
+  }
+
+  async function processPageImages() {
+    if (!user) { setNotice('Сначала войдите через Google.'); return; }
+    if (!form.pages.trim()) { setNotice('Сначала укажите номера страниц, которые вы загрузили.'); return; }
+    if (!uploadedPageImages.length) { setNotice('Выберите фото страниц.'); return; }
+    setTextbookSourceStatus({ state: 'checking', message: 'Подготавливаю фото страниц…' });
+    setNotice('');
+    try {
+      const loaded = await obtainTextbookPagesFromImages({
+        db, user, textbookId: textbookCacheId, part: form.part || '1', pagesString: form.pages, files: uploadedPageImages,
+        onProgress: (message) => setTextbookSourceStatus({ state: 'checking', message }),
+      });
+      const message = `Фото распознаны. Используются стр. ${form.pages}. ${loaded.source === 'uploaded-images' ? 'Текст готов для генерации и, где возможно, сохранён в Firestore.' : ''}`;
+      const ready = { ...loaded, signature: sourceSignature, message };
+      setUploadedTextbookSource(ready);
+      setActiveTextbookContext(loaded.text);
+      setManualTextbookText('');
+      setTextbookSourceStatus({ state: 'ready', message });
+    } catch (error) {
+      setTextbookSourceStatus({ state: 'missing', message: error?.message || 'Не удалось распознать фото страниц.' });
+    }
+  }
+
+  async function processUploadedPdf() {
+    if (!user) { setNotice('Сначала войдите через Google.'); return; }
+    if (!form.pages.trim()) { setNotice('Сначала укажите печатные страницы, которые нужны для урока.'); return; }
+    if (!uploadedPdfFile) { setNotice('Выберите PDF учебника.'); return; }
+    setTextbookSourceStatus({ state: 'checking', message: `Открываю ${uploadedPdfFile.name}…` });
+    setNotice('');
+    try {
+      const loaded = await obtainTextbookPagesFromUploadedPdf({
+        db, user, textbookId: textbookCacheId, part: form.part || '1', pagesString: form.pages, file: uploadedPdfFile,
+        onProgress: (message) => setTextbookSourceStatus({ state: 'checking', message }),
+      });
+      const message = `PDF обработан: стр. ${loaded.loadedPages.join(', ')}. Текст сохранён в вашем кэше Firestore.`;
+      const ready = { ...loaded, signature: sourceSignature, message };
+      setUploadedTextbookSource(ready);
+      setActiveTextbookContext(loaded.text);
+      setManualTextbookText('');
+      setTextbookSourceStatus({ state: 'ready', message });
+    } catch (error) {
+      setTextbookSourceStatus({ state: 'missing', message: error?.message || 'Не удалось прочитать PDF учебника.' });
     }
   }
 
@@ -363,7 +440,7 @@ export default function App() {
             </div>
             <div className="grid two">
               <Field label="Учебник" wide>
-                <select value={form.textbookId} onChange={(e) => { update('textbookId', e.target.value); setManualTextbookText(''); setActiveTextbookContext(''); setTextbookSourceStatus({ state: 'idle', message: '' }); }}>{books.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}</select>
+                <select value={form.textbookId} onChange={(e) => { update('textbookId', e.target.value); setManualTextbookText(''); setUploadedTextbookSource(null); setUploadedPageImages([]); setUploadedPdfFile(null); setActiveTextbookContext(''); setTextbookSourceStatus({ state: 'idle', message: '' }); }}>{books.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}</select>
                 <div className="textbook-resource-row">
                   <div className="textbook-resource-copy">
                     <b>Сверить страницы учебника</b>
@@ -374,11 +451,11 @@ export default function App() {
                   </a>
                 </div>
               </Field>
-              {currentBook?.custom && <Field label="Название / авторы учебника"><input value={form.customTextbook} onChange={(e) => update('customTextbook', e.target.value)} placeholder="Например: Английский язык, 10 класс…"/></Field>}
+              {currentBook?.custom && <Field label="Название / авторы учебника"><input value={form.customTextbook} onChange={(e) => { update('customTextbook', e.target.value); clearProcessedTextbookSource(); }} placeholder="Например: Английский язык, 10 класс…"/></Field>}
             </div>
             <div className="grid four">
-              <Field label="Часть"><input value={form.part} onChange={(e) => update('part', e.target.value)} placeholder="1"/></Field>
-              <Field label="Страницы"><input value={form.pages} onChange={(e) => { update('pages', e.target.value); setActiveTextbookContext(''); setTextbookSourceStatus({ state: 'idle', message: '' }); }} placeholder="23–26"/></Field>
+              <Field label="Часть"><input value={form.part} onChange={(e) => { update('part', e.target.value); clearProcessedTextbookSource(); }} placeholder="1"/></Field>
+              <Field label="Страницы"><input value={form.pages} onChange={(e) => { update('pages', e.target.value); clearProcessedTextbookSource(); }} placeholder="23–26"/></Field>
               <Field label="Unit (по желанию)"><input value={form.unit} onChange={(e) => update('unit', e.target.value)} placeholder="Unit 1"/></Field>
               <Field label="Lesson (по желанию)"><input value={form.lesson} onChange={(e) => update('lesson', e.target.value)} placeholder="Lesson 4"/></Field>
             </div>
@@ -390,8 +467,29 @@ export default function App() {
                 </button>
               </div>
               {textbookSourceStatus.message && <div className="textbook-source-status">{textbookSourceStatus.message}</div>}
-              <Field label="Резервный вариант — вставить текст вручную" hint="Нужен только если автоматическое получение конкретного издания временно не сработало. Вставленный текст всегда имеет приоритет." wide>
-                <textarea rows={5} value={manualTextbookText} onChange={(e) => { setManualTextbookText(e.target.value); setActiveTextbookContext(''); setTextbookSourceStatus({ state: e.target.value.trim() ? 'ready' : 'idle', message: e.target.value.trim() ? `Будет использован вставленный текст для стр. ${form.pages || 'указанных страниц'}.` : '' }); }} placeholder="Вставьте текст упражнений, диалогов, правил и заданий с выбранных страниц…"/>
+
+              <div className="textbook-upload-area">
+                <div className="textbook-upload-heading"><Upload size={17}/><div><b>Добавить материал самостоятельно</b><span>Можно загрузить фото нужных страниц или целый PDF учебника. Сайт извлечёт только страницы, указанные выше.</span></div></div>
+                <div className="textbook-upload-grid">
+                  <div className="upload-source-card">
+                    <div className="upload-source-icon"><ImagePlus size={20}/></div>
+                    <div><b>Фото страниц</b><p>JPG, PNG или WEBP. Лучше: одно фото = одна страница. Можно выбрать несколько.</p></div>
+                    <label className="secondary file-picker"><Camera size={14}/> Выбрать фото<input type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(e) => { setUploadedPageImages([...e.target.files].slice(0, 12)); setUploadedTextbookSource(null); setManualTextbookText(''); }}/></label>
+                    {uploadedPageImages.length > 0 && <div className="upload-selection"><span>{uploadedPageImages.length} файл(а): {uploadedPageImages.slice(0, 3).map((f) => f.name).join(', ')}{uploadedPageImages.length > 3 ? '…' : ''}</span><button type="button" className="primary small" onClick={processPageImages} disabled={textbookSourceStatus.state === 'checking'}><Sparkles size={14}/> Распознать фото</button></div>}
+                  </div>
+
+                  <div className="upload-source-card">
+                    <div className="upload-source-icon"><FileUp size={20}/></div>
+                    <div><b>PDF учебника</b><p>Выберите учебник с компьютера. Сам PDF никуда не сохраняется — в Firestore попадёт только текст выбранных страниц.</p></div>
+                    <label className="secondary file-picker"><FileText size={14}/> Выбрать PDF<input type="file" accept="application/pdf,.pdf" onChange={(e) => { setUploadedPdfFile(e.target.files?.[0] || null); setUploadedTextbookSource(null); setManualTextbookText(''); }}/></label>
+                    {uploadedPdfFile && <div className="upload-selection"><span>{uploadedPdfFile.name} · {(uploadedPdfFile.size / 1024 / 1024).toFixed(1)} МБ</span><button type="button" className="primary small" onClick={processUploadedPdf} disabled={textbookSourceStatus.state === 'checking'}><BookOpen size={14}/> Прочитать страницы</button></div>}
+                  </div>
+                </div>
+                <small className="upload-note">Для фото используется распознавание текста. Если вы загружаете разворот одним фото, сайт использует его как общий контекст для указанного диапазона страниц.</small>
+              </div>
+
+              <Field label="Ещё один вариант — вставить текст вручную" hint="Вставленный текст имеет приоритет над автоматическим источником, фото и PDF." wide>
+                <textarea rows={5} value={manualTextbookText} onChange={(e) => { setManualTextbookText(e.target.value); setUploadedTextbookSource(null); setActiveTextbookContext(''); setTextbookSourceStatus({ state: e.target.value.trim() ? 'ready' : 'idle', message: e.target.value.trim() ? `Будет использован вставленный текст для стр. ${form.pages || 'указанных страниц'}.` : '' }); }} placeholder="Вставьте текст упражнений, диалогов, правил и заданий с выбранных страниц…"/>
               </Field>
             </div>
             <Field label="Тема урока" wide hint={`В документе: ${titlePreview}`}><input className="large-input" value={form.topic} onChange={(e) => update('topic', e.target.value)} placeholder="Например: Mass Media"/></Field>

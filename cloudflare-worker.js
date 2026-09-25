@@ -1,6 +1,7 @@
 const FIREBASE_PROJECT_ID = "english-lesson-builder";
 const PRIMARY_MODEL = "qwen/qwen3.8-27b";
 const FALLBACK_MODEL = "openai/gpt-oss-120b";
+const VISION_FALLBACK_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 const ALLOWED_ORIGINS = new Set([
   "https://lukshaolga1982-ship-it.github.io",
@@ -480,6 +481,81 @@ async function callGroq(env, prompt, systemPrompt) {
   throw lastError || new Error("Не удалось получить ответ от Groq.");
 }
 
+
+async function callGroqVisionOcr(env, images) {
+  const models = [PRIMARY_MODEL, VISION_FALLBACK_MODEL];
+  const content = [{
+    type: "text",
+    text: `Ты выполняешь точное распознавание страниц школьного учебника английского языка.
+Для каждого изображения перепиши ВСЁ учебно значимое содержимое максимально близко к оригиналу:
+- заголовки, номера и формулировки упражнений;
+- английские тексты, диалоги, слова, таблицы и подписи;
+- русские инструкции, если они есть;
+- видимые номера страниц;
+- коротко опиши содержательно значимые иллюстрации в квадратных скобках, только если они нужны для выполнения задания.
+Не решай упражнения, не исправляй авторский текст, не переводи его и не придумывай пропущенное.
+Сохраняй порядок элементов сверху вниз. Для таблиц используй понятную текстовую структуру.
+Верни только JSON: {"pages":[{"label":"метка изображения","text":"распознанный текст"}]}. Порядок объектов должен совпадать с порядком изображений.`
+  }];
+
+  for (const image of images) {
+    content.push({ type: "text", text: `Метка следующего изображения: ${String(image.label || "страница").slice(0, 120)}` });
+    content.push({ type: "image_url", image_url: { url: image.dataUrl } });
+  }
+
+  let lastError = null;
+  for (const model of models) {
+    try {
+      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${env.GROQ_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content }],
+          temperature: 0.1,
+          max_completion_tokens: 9000,
+          response_format: { type: "json_object" },
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) { lastError = new Error(data?.error?.message || `Groq OCR вернул HTTP ${response.status} для ${model}`); continue; }
+      const raw = data?.choices?.[0]?.message?.content;
+      const parsed = safeJsonParse(raw || "");
+      const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
+      if (!pages.length) { lastError = new Error(`Модель ${model} не вернула распознанные страницы.`); continue; }
+      return { model, pages, usage: data.usage || null };
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error("Не удалось распознать изображения учебника.");
+}
+
+async function handleOcrTextbookImages(request, env, user) {
+  const OCR_DAILY_LIMIT = 30;
+  const used = await getUsage(env, user.sub, "ocr");
+  if (used >= OCR_DAILY_LIMIT) {
+    return jsonResponse(request, { ok: false, error: "OCR_LIMIT", message: "Лимит распознавания страниц на сегодня исчерпан.", limit: OCR_DAILY_LIMIT, used, remaining: 0 }, 429);
+  }
+
+  const body = await request.json();
+  const images = Array.isArray(body?.images) ? body.images.slice(0, 3) : [];
+  if (!images.length) return jsonResponse(request, { ok: false, error: "NO_IMAGES", message: "Не переданы изображения страниц." }, 400);
+  if (Array.isArray(body?.images) && body.images.length > 3) return jsonResponse(request, { ok: false, error: "TOO_MANY_IMAGES", message: "За один запрос можно распознать не более 3 изображений." }, 400);
+
+  let totalChars = 0;
+  const clean = images.map((item, index) => {
+    const dataUrl = String(item?.dataUrl || "");
+    const label = String(item?.label || `Фото ${index + 1}`).slice(0, 120);
+    if (!/^data:image\/(?:jpeg|jpg|png|webp);base64,/i.test(dataUrl)) throw new Error("Поддерживаются изображения JPG, PNG и WEBP.");
+    totalChars += dataUrl.length;
+    return { dataUrl, label };
+  });
+  if (totalChars > 18_000_000) return jsonResponse(request, { ok: false, error: "IMAGES_TOO_LARGE", message: "Изображения слишком большие. Попробуйте загрузить меньше страниц за один раз." }, 413);
+
+  const result = await callGroqVisionOcr(env, clean);
+  const next = await incrementUsage(env, user.sub, "ocr");
+  return jsonResponse(request, { ok: true, ...result, limit: OCR_DAILY_LIMIT, used: next, remaining: Math.max(0, OCR_DAILY_LIMIT - next) });
+}
+
 const LESSON_SYSTEM_PROMPT = `
 Ты — методист по английскому языку системы общего среднего образования Республики Беларусь.
 Создавай методически обоснованные планы-конспекты на русском языке, а реплики учителя,
@@ -559,6 +635,9 @@ export default {
         automaticTextbooks: Object.keys(TEXTBOOK_SOURCES),
         primaryModel: PRIMARY_MODEL,
         fallbackModel: FALLBACK_MODEL,
+        visionModel: PRIMARY_MODEL,
+        visionFallbackModel: VISION_FALLBACK_MODEL,
+        textbookImageOcr: true,
       });
     }
 
@@ -578,6 +657,8 @@ export default {
       if (url.pathname === "/textbook-pdf") return await handleTextbookPdf(request, env, user);
 
       if (!env.GROQ_API_KEY) return jsonResponse(request, { ok: false, error: "GROQ_NOT_CONFIGURED", message: "В Worker не найден секрет GROQ_API_KEY." }, 500);
+      if (url.pathname === "/ocr-textbook-images") return await handleOcrTextbookImages(request, env, user);
+
       if (url.pathname === "/generate") return await handleGenerate(request, env, user);
       if (url.pathname === "/refine") return await handleRefine(request, env, user);
       return jsonResponse(request, { ok: false, error: "NOT_FOUND" }, 404);
