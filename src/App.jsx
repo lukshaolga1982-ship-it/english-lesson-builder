@@ -13,8 +13,8 @@ import {
   competencies, defaultStages, extras, lessonTypes, literacies, speechActivities, textbookCatalog,
 } from './textbooks';
 import { findStageIndexForVariant, isMovementStage, resolveEnabledStages } from './methodology';
-import { exportLessonDocx } from './exportDocx';
-import { generateLesson, refineLessonStage } from './api';
+import { exportLessonDocx, exportWorksheetDocx } from './exportDocx';
+import { generateLesson, refineLessonStage, generateLessonWorksheet, rewriteLessonStoryBridges } from './api';
 import {
   buildTextbookCacheId, loadTextbookPagesFromFirestore, manualTextbookContext,
   obtainTextbookPagesAutomatically, obtainTextbookPagesFromImages, obtainTextbookPagesFromUploadedPdf, parsePageNumbers,
@@ -159,6 +159,9 @@ export default function App() {
   const [uploadedPdfFile, setUploadedPdfFile] = useState(null);
   const [uploadedTextbookSource, setUploadedTextbookSource] = useState(null);
   const [usageSummary, setUsageSummary] = useState(null);
+  const [worksheetBusy, setWorksheetBusy] = useState(false);
+  const [storyBusy, setStoryBusy] = useState(false);
+  const [worksheetSize, setWorksheetSize] = useState('Обычный (2 страницы)');
   const [pageCalibrationRequest, setPageCalibrationRequest] = useState(null);
   const [calibrationPrintedPage, setCalibrationPrintedPage] = useState('');
 
@@ -478,7 +481,7 @@ export default function App() {
         stage: current,
         previousStage: lesson.stages[index - 1] || null,
         nextStage: lesson.stages[index + 1] || null,
-        lessonContext: { title: lesson.title, meta: lesson.meta, lessonLogic: lesson.lessonLogic },
+        lessonContext: { title: lesson.title, meta: lesson.meta, lessonLogic: lesson.lessonLogic, storyThread: lesson.storyThread },
         form,
         textbookContext: activeTextbookContext,
       });
@@ -547,8 +550,67 @@ export default function App() {
     if (user) await saveLesson(next);
   }
 
+  async function generateWorksheet() {
+    if (!user || !lesson) return;
+    setWorksheetBusy(true); setNotice('');
+    try {
+      const result = await generateLessonWorksheet(user, {
+        lesson,
+        form,
+        textbookContext: activeTextbookContext,
+        size: worksheetSize,
+      });
+      const next = structuredClone(lesson);
+      next.appendices = { ...(next.appendices || {}), worksheet: result.worksheet };
+      setLesson(next);
+      setUsageSummary(result.usageSummary ?? null);
+      await saveLesson(next);
+    } catch (e) {
+      setNotice(`Не удалось создать рабочий лист: ${e.message}`);
+    } finally { setWorksheetBusy(false); }
+  }
+
+  async function rebuildStoryBridges() {
+    if (!user || !lesson) return;
+    setStoryBusy(true); setNotice('');
+    try {
+      const result = await rewriteLessonStoryBridges(user, {
+        lesson,
+        form,
+        textbookContext: activeTextbookContext,
+      });
+      const next = structuredClone(lesson);
+      next.storyThread = result.storyThread;
+      next.lessonLogic = result.lessonLogic;
+      for (const item of result.bridges || []) {
+        const index = Number(item?.index);
+        if (Number.isInteger(index) && index >= 0 && index < next.stages.length) {
+          next.stages[index].bridgeToNext = item.bridgeToNext || '';
+        }
+      }
+      if (next.stages?.length) next.stages[next.stages.length - 1].bridgeToNext = '';
+      setLesson(next);
+      setUsageSummary(result.usageSummary ?? null);
+      await saveLesson(next);
+    } catch (e) {
+      setNotice(`Не удалось перестроить сюжетные мостики: ${e.message}`);
+    } finally { setStoryBusy(false); }
+  }
+
+  function updateWorksheetTask(index, key, value) {
+    if (!lesson?.appendices?.worksheet || typeof lesson.appendices.worksheet !== 'object') return;
+    const next = structuredClone(lesson);
+    next.appendices.worksheet.tasks[index][key] = value;
+    setLesson(next);
+  }
+
   async function exportDocx() {
     await exportLessonDocx({ lesson, form: { ...form, textbookLabel: currentBook?.label || form.customTextbook }, format: form.format === 'Таблица' ? 'Таблица' : 'Подробный текст' });
+  }
+
+  async function exportWorksheet() {
+    if (!lesson?.appendices?.worksheet || typeof lesson.appendices.worksheet !== 'object') return;
+    await exportWorksheetDocx({ worksheet: lesson.appendices.worksheet, lesson, form });
   }
 
   const canNext = step !== 0 || form.topic.trim().length > 0;
@@ -565,7 +627,7 @@ export default function App() {
 
     <main className="page">
       <section className="hero">
-        <div><span className="eyebrow"><Sparkles size={14}/> Для учителей Республики Беларусь</span><h1>План-конспект урока<br/><em>с методической логикой</em></h1><p>Smart Lesson выстраивает задания в последовательность, связывает этапы логическими мостиками и предлагает несколько вариантов начала, двигательной паузы и рефлексии.</p></div>
+        <div><span className="eyebrow"><Sparkles size={14}/> Для учителей Республики Беларусь</span><h1>План-конспект урока<br/><em>с методической логикой</em></h1><p>Smart Lesson выстраивает урок как единую тематическую историю, связывает этапы содержательными мостиками и может создать рабочий лист к готовому плану.</p></div>
         <div className="hero-card"><Zap/><strong>Alibaba · Qwen3.8-27B</strong><span>5 полных генераций в сутки</span><small>Thinking mode отключён</small>{remaining !== null && <small>Сегодня осталось: {remaining}</small>}</div>
       </section>
 
@@ -659,7 +721,7 @@ export default function App() {
 
           {step === 1 && <>
             <div className="section-head"><div><span>Шаг 2</span><h2>Методический фокус</h2></div><WandSparkles/></div>
-            <div className="methodology-note"><Link2 size={18}/><div><b>Логические мостики включены автоматически</b><p>Результат каждого этапа должен стать основанием для следующего: результат → вопрос/дефицит → следующее действие.</p></div></div>
+            <div className="methodology-note"><Link2 size={18}/><div><b>Сквозная история и тематические мостики включены автоматически</b><p>Урок строится вокруг одной коммуникативной ситуации или проблемного вопроса. Каждый мостик продолжает тему: результат этапа → новый тематический вопрос/дефицит → следующее действие.</p></div></div>
             <h3>Виды речевой деятельности</h3><ChipGroup options={speechActivities} value={form.speechActivities} onChange={(v) => update('speechActivities', v)}/>
             <h3>Языковой материал</h3><ChipGroup options={['Лексика','Грамматика','Фонетика']} value={form.languageMaterial} onChange={(v) => update('languageMaterial', v)}/>
             <h3>Универсальные компетенции</h3><ChipGroup options={competencies} value={form.competencies} onChange={(v) => update('competencies', v)}/>
@@ -697,7 +759,7 @@ export default function App() {
           {step === 3 && !lesson && <>
             <div className="section-head"><div><span>Шаг 4</span><h2>Проверка перед генерацией</h2></div><Sparkles/></div>
             <div className="summary-grid"><div><span>Тема</span><b>{titlePreview}</b></div><div><span>Класс</span><b>{form.grade}, {form.level.toLowerCase()}</b></div><div><span>Урок</span><b>{form.lessonType}</b></div><div><span>Время</span><b>{selectedStageMinutes} минут</b></div><div><span>Учащихся</span><b>{form.studentCount}</b></div><div><span>Этапов</span><b>{effectiveStages.length}</b></div></div>
-            <div className="summary-long"><b>Компетенции</b><p>{form.competencies.join(', ') || 'Не выбраны'}</p><b>Функциональная грамотность</b><p>{form.literacies.join(', ') || 'Не выбрана'}</p><b>Дополнительно</b><p>{form.extras.join(', ') || 'Нет'}</p><b>Методическая логика</b><p>Цель → последовательная система упражнений → речевая кульминация → рефлексия по критериям успеха; между этапами — содержательные мостики.</p></div>
+            <div className="summary-long"><b>Компетенции</b><p>{form.competencies.join(', ') || 'Не выбраны'}</p><b>Функциональная грамотность</b><p>{form.literacies.join(', ') || 'Не выбрана'}</p><b>Дополнительно</b><p>{form.extras.join(', ') || 'Нет'}</p><b>Методическая логика</b><p>Одна тематическая история/коммуникативная ситуация → последовательная система упражнений → речевая кульминация → финал истории и рефлексия; мостики продолжают одну тему, а не просто переключают задания.</p></div>
             <div className={`source-summary ${textbookSourceStatus.state || 'idle'}`}><b>Опора на учебник</b><p>{form.pages ? (textbookSourceStatus.message || `Перед генерацией будут проверены стр. ${form.pages}.`) : 'Конкретные страницы не указаны.'}</p></div>
             <button className="generate" disabled={busy} onClick={generate}>{busy ? <RefreshCw className="spin"/> : <Sparkles/>}{busy ? 'Создаю и проверяю план…' : 'Создать план-конспект'}</button>
             <UsageSummaryCard usage={usageSummary} />
@@ -719,6 +781,17 @@ export default function App() {
             {lesson.sourceGrounding?.textbookUsed && <div className="source-grounding"><BookOpen size={18}/><div><b>Опора на учебник</b><p>{lesson.sourceGrounding.summary || `Использованы страницы: ${(lesson.sourceGrounding.pages || []).join(', ')}`}</p>{lesson.sourceGrounding.references?.length > 0 && <ul>{lesson.sourceGrounding.references.map((x, i)=><li key={i}>{x}</li>)}</ul>}</div></div>}
 
             {lesson.lessonLogic && <div className="logic-box"><Link2 size={18}/><div><b>Сквозная логика урока</b><p>{lesson.lessonLogic}</p></div></div>}
+            <div className="story-thread-box">
+              <div className="story-thread-main">
+                <div className="story-thread-title"><Sparkles size={17}/><div><span>Единая история урока</span><b>{lesson.storyThread?.title || 'Сквозная тематическая линия'}</b></div></div>
+                {lesson.storyThread?.situation && <p><strong>Ситуация:</strong> {lesson.storyThread.situation}</p>}
+                {lesson.storyThread?.drivingQuestion && <p><strong>Главный вопрос:</strong> {lesson.storyThread.drivingQuestion}</p>}
+                {lesson.storyThread?.finalOutcome && <p><strong>Финал:</strong> {lesson.storyThread.finalOutcome}</p>}
+              </div>
+              <button type="button" className="secondary story-rebuild" onClick={rebuildStoryBridges} disabled={storyBusy}>
+                {storyBusy ? <RefreshCw className="spin" size={15}/> : <Link2 size={15}/>} {storyBusy ? 'Перестраиваю…' : 'Сделать мостики одной историей'}
+              </button>
+            </div>
             {lesson.methodicalCheck?.summary && <div className="method-check"><div><b>Методическая самопроверка</b><p>{lesson.methodicalCheck.summary}</p></div><span>{lesson.methodicalCheck.timeTotal || selectedStageMinutes} мин</span>{lesson.methodicalCheck.warnings?.length > 0 && <ul>{lesson.methodicalCheck.warnings.map((x, i)=><li key={i}>{x}</li>)}</ul>}</div>}
 
             <AlternativeSection title="Креативное начало" subtitle="Три разных lead-in, каждый должен естественно запустить основную работу урока." kind="opening" items={lesson.creativeOptions?.opening} onApply={applyVariant} onFavorite={markPreferredVariant} selectedKey={lesson.preferredVariants?.opening?.key}/>
@@ -734,10 +807,42 @@ export default function App() {
                 <Field label="Деятельность учителя"><textarea rows={4} value={s.teacher || ''} onChange={(e) => updateStage(i,'teacher',e.target.value)}/></Field>
                 <Field label="Деятельность учащихся"><textarea rows={4} value={s.students || ''} onChange={(e) => updateStage(i,'students',e.target.value)}/></Field>
                 <Field label="Задания / ход работы" wide><textarea rows={5} value={s.activities || ''} onChange={(e) => updateStage(i,'activities',e.target.value)}/></Field>
-                {i < lesson.stages.length - 1 && <Field label="Логический мостик к следующему этапу" wide hint="Результат → вопрос / дефицит → следующее действие"><textarea className="bridge-textarea" rows={3} value={s.bridgeToNext || ''} onChange={(e) => updateStage(i,'bridgeToNext',e.target.value)}/></Field>}
+                {i < lesson.stages.length - 1 && <Field label="Логический мостик к следующему этапу" wide hint="Продолжение общей истории: результат этапа → тематический вопрос/дефицит → следующее действие"><textarea className="bridge-textarea" rows={3} value={s.bridgeToNext || ''} onChange={(e) => updateStage(i,'bridgeToNext',e.target.value)}/></Field>}
               </div>
               <div className="stage-tags">{(s.competencies || []).map(x=><span key={x}>{x}</span>)}{(s.literacy || []).map(x=><span key={x}>{x}</span>)}</div>
             </article>)}</div>
+
+            <section className="worksheet-section">
+              <div className="worksheet-head">
+                <div><span>Дополнительный материал</span><h3>Рабочий лист к уроку</h3><p>Генерируется по текущей версии урока и продолжает ту же тематическую историю.</p></div>
+                <FileText size={22}/>
+              </div>
+              <div className="worksheet-actions">
+                <select value={worksheetSize} onChange={(e) => setWorksheetSize(e.target.value)}>
+                  <option>Краткий (1 страница)</option>
+                  <option>Обычный (2 страницы)</option>
+                  <option>Расширенный (3 страницы)</option>
+                </select>
+                <button type="button" className="primary" onClick={generateWorksheet} disabled={worksheetBusy}>
+                  {worksheetBusy ? <RefreshCw className="spin" size={16}/> : <Sparkles size={16}/>} {worksheetBusy ? 'Создаю рабочий лист…' : (lesson.appendices?.worksheet && typeof lesson.appendices.worksheet === 'object' ? 'Сгенерировать заново' : 'Сгенерировать рабочий лист')}
+                </button>
+                {lesson.appendices?.worksheet && typeof lesson.appendices.worksheet === 'object' && <button type="button" className="secondary" onClick={exportWorksheet}><Download size={16}/> Скачать Word</button>}
+              </div>
+              {lesson.appendices?.worksheet && typeof lesson.appendices.worksheet === 'object' && <div className="worksheet-editor">
+                <Field label="Название рабочего листа" wide><input value={lesson.appendices.worksheet.title || ''} onChange={(e) => setLesson({...lesson, appendices:{...(lesson.appendices||{}), worksheet:{...lesson.appendices.worksheet, title:e.target.value}}})}/></Field>
+                <Field label="Введение / сюжетная задача" wide><textarea rows={3} value={lesson.appendices.worksheet.intro || ''} onChange={(e) => setLesson({...lesson, appendices:{...(lesson.appendices||{}), worksheet:{...lesson.appendices.worksheet, intro:e.target.value}}})}/></Field>
+                <div className="worksheet-task-list">{(lesson.appendices.worksheet.tasks || []).map((task, i) => <article className="worksheet-task-card" key={`${task.number}-${i}`}>
+                  <div className="worksheet-task-number">{task.number || i + 1}</div>
+                  <div className="worksheet-task-fields">
+                    <Field label="Название"><input value={task.title || ''} onChange={(e) => updateWorksheetTask(i,'title',e.target.value)}/></Field>
+                    <Field label="Инструкция"><textarea rows={2} value={task.instruction || ''} onChange={(e) => updateWorksheetTask(i,'instruction',e.target.value)}/></Field>
+                    <Field label="Материал задания" wide><textarea rows={5} value={task.content || ''} onChange={(e) => updateWorksheetTask(i,'content',e.target.value)}/></Field>
+                  </div>
+                </article>)}</div>
+                <Field label="Самопроверка / финал истории" wide><textarea rows={3} value={lesson.appendices.worksheet.selfCheck || ''} onChange={(e) => setLesson({...lesson, appendices:{...(lesson.appendices||{}), worksheet:{...lesson.appendices.worksheet, selfCheck:e.target.value}}})}/></Field>
+                <EditableArray label="Ключи рабочего листа для учителя" items={lesson.appendices.worksheet.teacherKey || []} onChange={(v) => setLesson({...lesson, appendices:{...(lesson.appendices||{}), worksheet:{...lesson.appendices.worksheet, teacherKey:v}}})}/>
+              </div>}
+            </section>
 
             {lesson.listening?.included && <div className="appendix"><h3>Аудирование</h3><Field label="Текст для озвучивания"><textarea rows={8} value={lesson.listening.script} onChange={(e)=>setLesson({...lesson,listening:{...lesson.listening,script:e.target.value}})}/></Field><EditableArray label="Задания" items={lesson.listening.tasks} onChange={(v)=>setLesson({...lesson,listening:{...lesson.listening,tasks:v}})}/><EditableArray label="Ответы" items={lesson.listening.answers} onChange={(v)=>setLesson({...lesson,listening:{...lesson.listening,answers:v}})}/></div>}
             <div className="appendix"><h3>Домашнее задание</h3><textarea rows={3} value={lesson.homework || ''} onChange={(e)=>setLesson({...lesson,homework:e.target.value})}/><h3>Ключи для учителя</h3><EditableArray label="Ответы" items={lesson.answerKeys || []} onChange={(v)=>setLesson({...lesson,answerKeys:v})}/></div>

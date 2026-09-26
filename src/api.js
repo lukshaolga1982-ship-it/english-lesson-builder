@@ -37,7 +37,7 @@ async function apiRequest(path, user, body) {
     }
     if (error instanceof TypeError && /failed to fetch/i.test(error.message || '')) {
       const origin = typeof window !== 'undefined' ? window.location.origin : 'неизвестный origin';
-      throw new Error(`Браузер не получил ответ от Cloudflare Worker (origin: ${origin}). Проверьте /health. В версии v18 запрос идёт без CORS preflight и с потоковым keep-alive.`);
+      throw new Error(`Браузер не получил ответ от Cloudflare Worker (origin: ${origin}). Проверьте /health. В версии v20 запрос идёт без CORS preflight и с потоковым keep-alive.`);
     }
     throw error;
   } finally {
@@ -97,6 +97,39 @@ function normalizeCreativeOptions(raw = {}) {
   };
 }
 
+function normalizeStoryThread(raw = {}) {
+  if (typeof raw === 'string') {
+    return { title: '', situation: raw, drivingQuestion: '', finalOutcome: '' };
+  }
+  return {
+    title: raw?.title || raw?.name || '',
+    situation: raw?.situation || raw?.frame || raw?.context || '',
+    drivingQuestion: raw?.drivingQuestion || raw?.question || '',
+    finalOutcome: raw?.finalOutcome || raw?.finalProduct || raw?.outcome || '',
+  };
+}
+
+export function normalizeWorksheet(raw = {}) {
+  const data = raw?.worksheet || raw || {};
+  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  return {
+    title: data.title || 'Рабочий лист',
+    subtitle: data.subtitle || '',
+    studentHeader: data.studentHeader || 'Name: ____________________   Class: ______   Date: __________',
+    intro: data.intro || '',
+    tasks: tasks.map((task, index) => ({
+      number: Number(task?.number ?? index + 1),
+      title: task?.title || `Task ${index + 1}`,
+      instruction: task?.instruction || '',
+      content: task?.content || task?.items || '',
+      answerSpaceLines: Math.max(0, Math.min(8, Number(task?.answerSpaceLines ?? task?.lines ?? 0) || 0)),
+    })),
+    selfCheck: data.selfCheck || '',
+    teacherKey: toArray(data.teacherKey || data.answers || data.key),
+    teacherNote: data.teacherNote || '',
+  };
+}
+
 export function normalizeLesson(raw, form = {}) {
   const data = raw?.lesson || raw || {};
   const objectives = data.objectives || {};
@@ -126,6 +159,7 @@ export function normalizeLesson(raw, form = {}) {
       languageMaterial: toArray(meta.languageMaterial || data.languageMaterial || form.languageMaterial),
     },
     lessonLogic: data.lessonLogic || '',
+    storyThread: normalizeStoryThread(data.storyThread || data.storyline || data.lessonStory || {}),
     sourceGrounding: {
       textbookUsed: Boolean(data.sourceGrounding?.textbookUsed),
       pages: toArray(data.sourceGrounding?.pages).map((x) => String(x)),
@@ -167,6 +201,12 @@ function lessonJsonContract() {
       languageMaterial: ['string'],
     },
     lessonLogic: 'кратко опиши сквозную содержательную логику урока и кульминационную коммуникативную задачу',
+    storyThread: {
+      title: 'короткое название сквозной сюжетной/коммуникативной линии',
+      situation: 'единая тематическая ситуация, которая естественно объединяет этапы урока',
+      drivingQuestion: 'главный вопрос/проблема, к которой класс возвращается по ходу урока',
+      finalOutcome: 'что учащиеся создают/решают/могут сказать к финалу этой истории',
+    },
     sourceGrounding: {
       textbookUsed: 'boolean — true только если в запросе передан фактический текст страниц',
       pages: ['номера реально использованных страниц'],
@@ -188,7 +228,7 @@ function lessonJsonContract() {
       assessment: 'как проверяется результат',
       materials: 'string',
       answers: 'ключ/образец, если применимо',
-      bridgeToNext: '1–3 естественные реплики учителя, связывающие результат этого этапа со следующим; у последнего этапа пустая строка',
+      bridgeToNext: '1–3 естественные реплики учителя: продолжение одной тематической истории урока + результат текущего этапа → новый тематический вопрос/дефицит → следующее действие; у последнего этапа пустая строка',
     }],
     creativeOptions: {
       opening: ['ровно 3 объекта варианта по структуре ниже'],
@@ -269,7 +309,7 @@ function compactSourceInfo(info = {}, trimmed = false) {
 
 const OUTPUT_SCHEMA = `{
 "title":"", "meta":{"goal":"","successCriteria":[],"tasks":{"educational":[],"developmental":[],"upbringing":[]},"equipment":[],"forms":[],"methods":[],"plannedResults":[],"languageMaterial":[]},
-"lessonLogic":"", "sourceGrounding":{"textbookUsed":true,"pages":[],"references":[],"summary":""},
+"lessonLogic":"", "storyThread":{"title":"","situation":"","drivingQuestion":"","finalOutcome":""}, "sourceGrounding":{"textbookUsed":true,"pages":[],"references":[],"summary":""},
 "stages":[{"id":"","name":"","duration":0,"purpose":"","stageResult":"","teacher":"","students":"","activities":"","forms":[],"competencies":[],"literacy":[],"assessment":"","materials":"","answers":"","bridgeToNext":""}],
 "creativeOptions":{"opening":[],"movement":[],"reflection":[]},
 "methodicalCheck":{"summary":"","strengths":[],"warnings":[],"timeTotal":0},
@@ -298,15 +338,19 @@ export async function generateLesson(user, payload) {
 ОБЯЗАТЕЛЬНО:
 - Если текст учебника есть, реально используй его тексты, лексику, грамматику и видимые упражнения; не выдумывай номера/содержание отсутствующих заданий. Авторские задания только развивают материал учебника.
 - Каждый этап имеет конкретный stageResult. Его результат используется дальше.
-- Между каждой парой соседних этапов bridgeToNext = результат текущего этапа → вопрос/дефицит → необходимость следующего действия; никаких пустых «переходим дальше».
+- Сначала придумай ОДНУ сквозную storyThread, строго связанную с темой урока и учебным материалом: ситуация → drivingQuestion → finalOutcome. Это не случайная игра и не отдельные мини-сюжеты. Если теме не подходит ролевая история, используй естественную проблемную/исследовательскую линию.
+- Весь урок должен ощущаться как одна история/коммуникативная ситуация: начало запускает storyThread, каждый следующий этап продвигает её, речевая кульминация решает главный вопрос, а рефлексия возвращается к drivingQuestion и finalOutcome.
+- Между каждой парой соседних этапов bridgeToNext = тематическое продолжение этой же storyThread + конкретный результат текущего этапа → новый вопрос/дефицит по ТЕМЕ → необходимость следующего действия. Используй лексику, персонажей/объекты, факты или проблему текущей темы. Никаких «теперь перейдём дальше», «а сейчас следующее задание» и никаких мостиков, не связанных с темой.
+- Мостик должен звучать как 1–3 естественные реплики учителя, которые можно реально сказать классу. Не объясняй учащимся методическую структуру урока.
 - Целевая лексика/грамматика проходит от тренировки к речевой задаче. Информация чтения/аудирования используется далее в говорении/письме, если это соответствует цели.
 - Рефлексия проверяет цель и successCriteria.
 - Сумма duration всех stages строго = ${Number(payload.duration)} минут.
 - Используй только enabledStages и сохраняй их логичный порядок.
 - Для проверяемых заданий дай ключ/образец.
-- creativeOptions.opening: ровно 3 разных lead-in; movement: ровно ${movementCount}; reflection: ровно 3. Варианты короткие, тематические, возрастно уместные и не считаются во время основного урока. ${VARIANT_FIELDS}
+- creativeOptions.opening: ровно 3 разных lead-in; movement: ровно ${movementCount}; reflection: ровно 3. Варианты короткие, возрастно уместные и продолжают ту же storyThread, а не создают отдельную тему/историю. ${VARIANT_FIELDS}
 - Если contextTrimmed=true, добавь предупреждение в methodicalCheck.warnings и не придумывай пропущенный фрагмент.
 - sourceGrounding.textbookUsed=true только если фактический текст выше не пустой; references = 3–8 конкретных опор, реально видимых в тексте.
+- appendices.worksheet оставь пустой строкой: рабочий лист генерируется отдельно по кнопке после готового урока.
 - Пиши достаточно подробно для работы учителя, но без повторов и методических пояснений ради объёма.
 
 СХЕМА ОТВЕТА:${OUTPUT_SCHEMA}`;
@@ -326,7 +370,7 @@ export async function refineLessonStage(user, { mode, stage, previousStage, next
     interesting: 'Сделай этап интереснее и активнее без случайной игры.',
     simpler: 'Сделай этап проще: снизь нагрузку и добавь опоры.',
     harder: 'Сделай этап сложнее: больше самостоятельности, выбора и аргументации.',
-    bridge: 'Сохрани задание, но улучши stageResult и bridgeToNext.',
+    bridge: 'Сохрани задание, но перепиши stageResult и bridgeToNext так, чтобы мостик был частью единой тематической истории урока, а не техническим переходом.',
   }[mode] || 'Улучши этап без изменения его функции.';
 
   const methodology = buildMethodologyContext({ ...form, enabledStages: [stage?.name].filter(Boolean) }, { compact: true });
@@ -338,9 +382,10 @@ export async function refineLessonStage(user, { mode, stage, previousStage, next
     grade: form?.grade,
     level: form?.level,
     leadingActivity: form?.leadingActivity,
+    storyThread: lessonContext?.storyThread || {},
   };
   const prompt = `${modeText} Верни только JSON одного этапа с полями name,duration,purpose,stageResult,teacher,students,activities,forms,competencies,literacy,assessment,materials,answers,bridgeToNext.
-Логический мостик: конкретный результат текущего этапа → вопрос/дефицит → следующее действие. Если следующего этапа нет, bridgeToNext="".
+Логический мостик должен продолжать storyThread урока: используй тему, ситуацию, главный вопрос, факты/лексику текущего материала. Формула: конкретный результат текущего этапа → новый ТЕМАТИЧЕСКИЙ вопрос/дефицит внутри той же истории → следующее действие. Это 1–3 естественные реплики учителя, а не методическое «переходим к...». Если следующего этапа нет, bridgeToNext="".
 КОНТЕКСТ:${JSON.stringify(compactContext)}
 МЕТОДИКА:${JSON.stringify(methodology)}
 УЧЕБНИК:${book || '[не передан]'}
@@ -350,6 +395,101 @@ export async function refineLessonStage(user, { mode, stage, previousStage, next
   const data = await apiRequest('/refine', user, { prompt });
   return {
     stage: normalizeStage(data.result?.stage || data.result),
+    remaining: data.remaining,
+    model: data.model,
+    usageSummary: data.usageSummary || null,
+  };
+}
+
+function compactLessonForWorksheet(lesson = {}) {
+  return {
+    title: lesson.title || '',
+    goal: lesson.meta?.goal || '',
+    successCriteria: lesson.meta?.successCriteria || [],
+    languageMaterial: lesson.meta?.languageMaterial || [],
+    lessonLogic: lesson.lessonLogic || '',
+    storyThread: lesson.storyThread || {},
+    sourceGrounding: lesson.sourceGrounding || {},
+    stages: (lesson.stages || []).map((s) => ({
+      name: s.name,
+      duration: s.duration,
+      stageResult: s.stageResult,
+      activities: s.activities,
+      materials: s.materials,
+      answers: s.answers,
+      bridgeToNext: s.bridgeToNext,
+    })),
+    preferredVariants: lesson.preferredVariants || {},
+  };
+}
+
+export async function generateLessonWorksheet(user, { lesson, form, textbookContext = '', size = 'Обычный (2 страницы)' }) {
+  const book = compactTextbookContext(textbookContext, 8000).text;
+  const context = compactLessonForWorksheet(lesson);
+  const prompt = `Создай печатный рабочий лист учащегося к УЖЕ ГОТОВОМУ уроку английского языка. Верни только JSON.
+
+ПАРАМЕТРЫ КЛАССА:${JSON.stringify({ grade: form?.grade, level: form?.level, topic: form?.topic, pages: form?.pages, differentiation: form?.differentiation, size })}
+УРОК:${JSON.stringify(context)}
+ТЕКСТ УЧЕБНИКА:${book || '[не передан]'}
+
+ТРЕБОВАНИЯ:
+- Рабочий лист должен обслуживать именно этот урок, а не быть отдельным набором случайных упражнений.
+- Сохраняй ту же storyThread/коммуникативную ситуацию, drivingQuestion и финальную задачу. Задания листа должны ощущаться как последовательные шаги одной истории.
+- Не выдумывай факты/тексты/номера упражнений, которых нет в переданном учебнике или плане.
+- Используй целевую лексику и грамматику урока. Не дублируй дословно весь учебник.
+- Уровень и объём соответствуют ${form?.grade || ''} классу и уровню ${form?.level || ''}.
+- Дай 5–7 заданий для размера «Обычный», 3–4 для «Краткий», 7–9 для «Расширенный».
+- Сделай задания разными: понимание/лексика/грамматика/работа с информацией/говорение или подготовка к говорению — только если это соответствует уроку.
+- В student-части НЕ показывай ответы. Ответы вынеси только в teacherKey.
+- content — готовый для печати текст задания; списки оформляй переносами строк. answerSpaceLines = сколько пустых строк оставить ученику (0–8).
+- selfCheck должен возвращать к критериям успеха и главному вопросу истории.
+
+JSON:
+{"worksheet":{"title":"","subtitle":"","studentHeader":"Name: ____________________   Class: ______   Date: __________","intro":"","tasks":[{"number":1,"title":"","instruction":"","content":"","answerSpaceLines":0}],"selfCheck":"","teacherKey":[],"teacherNote":""}}`;
+  const data = await apiRequest('/refine', user, { prompt });
+  return {
+    worksheet: normalizeWorksheet(data.result?.worksheet || data.result),
+    remaining: data.remaining,
+    model: data.model,
+    usageSummary: data.usageSummary || null,
+  };
+}
+
+export async function rewriteLessonStoryBridges(user, { lesson, form, textbookContext = '' }) {
+  const book = compactTextbookContext(textbookContext, 6500).text;
+  const stages = (lesson?.stages || []).map((s, index) => ({
+    index,
+    id: s.id || `stage-${index}`,
+    name: s.name,
+    stageResult: s.stageResult,
+    activities: s.activities,
+    bridgeToNext: s.bridgeToNext,
+  }));
+  const prompt = `Перепиши ТОЛЬКО сквозную сюжетно-коммуникативную линию и мостики между этапами уже готового урока. Сами задания, время и порядок этапов не меняй. Верни только JSON.
+
+ТЕМА/ПАРАМЕТРЫ:${JSON.stringify({ topic: form?.topic, grade: form?.grade, level: form?.level, leadingActivity: form?.leadingActivity })}
+ЦЕЛЬ:${JSON.stringify(lesson?.meta?.goal || '')}
+ТЕКУЩАЯ ЛОГИКА:${JSON.stringify(lesson?.lessonLogic || '')}
+ЭТАПЫ:${JSON.stringify(stages)}
+УЧЕБНИК:${book || '[не передан]'}
+
+Создай ОДНУ естественную историю/коммуникативную ситуацию, полностью связанную с темой. Если ролевая история неуместна, это может быть единый проблемный вопрос, расследование, выбор, подготовка продукта или последовательное решение реальной коммуникативной задачи.
+Каждый bridgeToNext должен:
+1) опираться на конкретный результат текущего этапа;
+2) продолжать ту же ситуацию и лексику темы;
+3) порождать следующий тематический вопрос/дефицит;
+4) естественно подводить к уже существующему следующему заданию;
+5) звучать как 1–3 реплики учителя, а не как методическое пояснение.
+Последний мостик = "". Финал и рефлексия должны закрывать drivingQuestion.
+
+JSON:
+{"storyThread":{"title":"","situation":"","drivingQuestion":"","finalOutcome":""},"lessonLogic":"","bridges":[{"index":0,"bridgeToNext":""}]}`;
+  const data = await apiRequest('/refine', user, { prompt });
+  const result = data.result || {};
+  return {
+    storyThread: normalizeStoryThread(result.storyThread || result.storyline || {}),
+    lessonLogic: result.lessonLogic || lesson?.lessonLogic || '',
+    bridges: Array.isArray(result.bridges) ? result.bridges : [],
     remaining: data.remaining,
     model: data.model,
     usageSummary: data.usageSummary || null,

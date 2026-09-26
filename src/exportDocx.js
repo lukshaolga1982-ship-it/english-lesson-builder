@@ -28,6 +28,54 @@ const labelPara = (label, value) => new Paragraph({
 
 const arrayText = (value) => Array.isArray(value) ? value.filter(Boolean).join('; ') : (value || '—');
 
+
+const multilineParagraphs = (text = '', opts = {}) => String(text || '')
+  .split(/\r?\n/)
+  .map((line) => para(line || ' ', opts));
+
+function worksheetBody(worksheet, { includeTeacherKey = false, pageBreakBefore = false } = {}) {
+  if (!worksheet || typeof worksheet !== 'object') return [];
+  const out = [
+    new Paragraph({
+      heading: HeadingLevel.HEADING_1,
+      pageBreakBefore,
+      spacing: { line: 240, before: 120, after: 80 },
+      children: [run(worksheet.title || 'Рабочий лист', { bold: true })],
+    }),
+  ];
+  if (worksheet.subtitle) out.push(para(worksheet.subtitle));
+  out.push(para(worksheet.studentHeader || 'Name: ____________________   Class: ______   Date: __________'));
+  if (worksheet.intro) out.push(...multilineParagraphs(worksheet.intro));
+
+  for (const [index, task] of (worksheet.tasks || []).entries()) {
+    out.push(new Paragraph({
+      heading: HeadingLevel.HEADING_2,
+      spacing: { line: 240, before: 140, after: 40 },
+      children: [run(`${task.number || index + 1}. ${task.title || `Task ${index + 1}`}`, { bold: true })],
+    }));
+    if (task.instruction) out.push(para(task.instruction, { run: { italic: true } }));
+    if (task.content) out.push(...multilineParagraphs(task.content));
+    const lines = Math.max(0, Math.min(8, Number(task.answerSpaceLines || 0)));
+    for (let i = 0; i < lines; i += 1) out.push(para('________________________________________________________________________________'));
+  }
+
+  if (worksheet.selfCheck) {
+    out.push(new Paragraph({ heading: HeadingLevel.HEADING_2, spacing: { line: 240, before: 140, after: 40 }, children: [run('Self-check', { bold: true })] }));
+    out.push(...multilineParagraphs(worksheet.selfCheck));
+  }
+
+  if (includeTeacherKey && (worksheet.teacherKey || []).length) {
+    out.push(new Paragraph({
+      heading: HeadingLevel.HEADING_1,
+      pageBreakBefore: true,
+      children: [run('Ключи рабочего листа для учителя', { bold: true })],
+    }));
+    (worksheet.teacherKey || []).forEach((x, i) => out.push(labelPara(`${i + 1}`, x)));
+    if (worksheet.teacherNote) out.push(labelPara('Примечание', worksheet.teacherNote));
+  }
+  return out;
+}
+
 function stageTable(lesson) {
   const header = ['Этап', 'Время', 'Результат этапа', 'Деятельность учителя', 'Деятельность учащихся', 'Логический мостик'];
   const rows = [
@@ -99,6 +147,12 @@ export async function exportLessonDocx({ lesson, form, format }) {
       labelPara('Конкретные опоры из учебника', arrayText(lesson.sourceGrounding.references)),
     ] : []),
     ...(lesson.lessonLogic ? [labelPara('Сквозная логика урока', lesson.lessonLogic)] : []),
+    ...(lesson.storyThread?.situation ? [
+      labelPara('Сюжетная линия урока', lesson.storyThread.title || 'Единая тематическая история'),
+      labelPara('Ситуация', lesson.storyThread.situation),
+      labelPara('Главный вопрос', lesson.storyThread.drivingQuestion),
+      labelPara('Финал истории', lesson.storyThread.finalOutcome),
+    ] : []),
     para('', {}),
     new Paragraph({ heading: HeadingLevel.HEADING_1, children: [run('Ход урока', { bold: true })] }),
     ...(format === 'Таблица' ? [stageTable(lesson)] : detailedStages(lesson)),
@@ -123,7 +177,10 @@ export async function exportLessonDocx({ lesson, form, format }) {
 
   if (lesson.appendices?.worksheet || lesson.appendices?.cards) {
     children.push(new Paragraph({ heading: HeadingLevel.HEADING_1, children: [run('Приложения', { bold: true })] }));
-    if (lesson.appendices.worksheet) children.push(labelPara('Рабочий лист', lesson.appendices.worksheet));
+    if (lesson.appendices.worksheet) {
+      if (typeof lesson.appendices.worksheet === 'object') children.push(...worksheetBody(lesson.appendices.worksheet, { includeTeacherKey: true, pageBreakBefore: true }));
+      else children.push(labelPara('Рабочий лист', lesson.appendices.worksheet));
+    }
     if (lesson.appendices.cards) children.push(labelPara('Карточки', lesson.appendices.cards));
   }
 
@@ -145,3 +202,26 @@ export async function exportLessonDocx({ lesson, form, format }) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(href), 1500);
 }
+
+export async function exportWorksheetDocx({ worksheet, lesson, form }) {
+  if (!worksheet || typeof worksheet !== 'object') return;
+  const children = worksheetBody(worksheet, { includeTeacherKey: true, pageBreakBefore: false });
+  const doc = new Document({
+    styles: {
+      default: {
+        document: { run: { font: FONT, size: SIZE }, paragraph: { spacing: { line: 240, after: 0 } } },
+      },
+    },
+    sections: [{ properties: {}, children }],
+  });
+  const blob = await Packer.toBlob(doc);
+  const base = worksheet.title || lesson?.title || form?.topic || 'worksheet';
+  const safe = String(base).replace(/[\/:*?"<>|]/g, '_').slice(0, 80);
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = href;
+  a.download = `${safe}_worksheet.docx`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(href), 1500);
+}
+
