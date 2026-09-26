@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   BookOpen, Camera, Check, ChevronLeft, ChevronRight, Download, ExternalLink, FileText, FileUp, History,
-  ImagePlus, Link2, LogIn, LogOut, RefreshCw, Save, Sparkles, Upload, WandSparkles, X, Zap,
+  ImagePlus, Link2, LogIn, LogOut, RefreshCw, Save, Sparkles, Star, Upload, WandSparkles, X, Zap,
 } from 'lucide-react';
 import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
 import {
@@ -79,17 +79,27 @@ function EditableArray({ label, items = [], onChange }) {
   }} />)}</div>;
 }
 
-function AlternativeSection({ title, subtitle, items = [], kind, onApply }) {
+function AlternativeSection({ title, subtitle, items = [], kind, onApply, onFavorite, selectedKey }) {
   if (!items.length) return null;
   return <section className="alternatives-section">
     <div className="alternatives-head"><div><span>Выбор приёма</span><h3>{title}</h3><p>{subtitle}</p></div><Sparkles size={20}/></div>
-    <div className="alternative-grid">{items.slice(0, 3).map((item, i) => <article className="alternative-card" key={item.id || `${kind}-${i}`}>
-      <div className="alternative-top"><span>{String(i + 1).padStart(2, '0')}</span><div><h4>{item.title}</h4><small>{item.technique || 'Авторский вариант'}{item.duration ? ` · ${item.duration} мин` : ''}</small></div></div>
-      {item.rationale && <p className="alternative-why">{item.rationale}</p>}
-      <p><b>Ход:</b> {item.activities || item.teacher}</p>
-      {item.bridgeToNext && <div className="bridge-preview"><Link2 size={14}/><span>{item.bridgeToNext}</span></div>}
-      <button className="secondary alternative-apply" onClick={() => onApply(kind, item)}><Check size={15}/> Применить этот вариант</button>
-    </article>)}</div>
+    <div className="alternative-grid">{items.slice(0, 3).map((item, i) => {
+      const optionKey = item.id || `${kind}-${i}`;
+      const selected = selectedKey === optionKey;
+      return <article className={`alternative-card ${selected ? 'selected' : ''}`} key={optionKey}>
+        <div className="alternative-top-row">
+          <div className="alternative-top"><span>{String(i + 1).padStart(2, '0')}</span><div><h4>{item.title}</h4><small>{item.technique || 'Авторский вариант'}{item.duration ? ` · ${item.duration} мин` : ''}</small></div></div>
+          <button type="button" className={`alternative-favorite ${selected ? 'selected' : ''}`} onClick={() => onFavorite(kind, optionKey, item)} title={selected ? 'Снять отметку' : 'Отметить понравившийся вариант'}>
+            <Star size={16} fill={selected ? 'currentColor' : 'none'}/>
+          </button>
+        </div>
+        {selected && <div className="alternative-selected-label"><Star size={12} fill="currentColor"/> Выбранный вариант</div>}
+        {item.rationale && <p className="alternative-why">{item.rationale}</p>}
+        <p><b>Ход:</b> {item.activities || item.teacher}</p>
+        {item.bridgeToNext && <div className="bridge-preview"><Link2 size={14}/><span>{item.bridgeToNext}</span></div>}
+        <button className={`secondary alternative-apply ${selected ? 'selected' : ''}`} onClick={() => onApply(kind, item, optionKey)}><Check size={15}/> {selected ? 'Применить выбранный вариант' : 'Применить этот вариант'}</button>
+      </article>;
+    })}</div>
   </section>;
 }
 
@@ -485,7 +495,23 @@ export default function App() {
     const next = structuredClone(lesson); next.stages[index][key] = value; setLesson(next);
   }
 
-  async function applyVariant(kind, option) {
+  async function markPreferredVariant(kind, optionKey, option) {
+    if (!lesson) return;
+    const next = structuredClone(lesson);
+    const current = next.preferredVariants?.[kind]?.key;
+    next.preferredVariants = {
+      ...(next.preferredVariants || {}),
+      [kind]: current === optionKey ? null : {
+        key: optionKey,
+        title: option?.title || '',
+        technique: option?.technique || '',
+      },
+    };
+    setLesson(next);
+    if (user) await saveLesson(next);
+  }
+
+  async function applyVariant(kind, option, optionKey = null) {
     if (!lesson) return;
     const index = findStageIndexForVariant(kind, lesson.stages);
     if (index < 0) {
@@ -507,6 +533,16 @@ export default function App() {
       stageResult: option.stageResult || current.stageResult,
       bridgeToNext: option.bridgeToNext || current.bridgeToNext,
     };
+    if (optionKey) {
+      next.preferredVariants = {
+        ...(next.preferredVariants || {}),
+        [kind]: {
+          key: optionKey,
+          title: option?.title || '',
+          technique: option?.technique || '',
+        },
+      };
+    }
     setLesson(next);
     if (user) await saveLesson(next);
   }
@@ -685,9 +721,9 @@ export default function App() {
             {lesson.lessonLogic && <div className="logic-box"><Link2 size={18}/><div><b>Сквозная логика урока</b><p>{lesson.lessonLogic}</p></div></div>}
             {lesson.methodicalCheck?.summary && <div className="method-check"><div><b>Методическая самопроверка</b><p>{lesson.methodicalCheck.summary}</p></div><span>{lesson.methodicalCheck.timeTotal || selectedStageMinutes} мин</span>{lesson.methodicalCheck.warnings?.length > 0 && <ul>{lesson.methodicalCheck.warnings.map((x, i)=><li key={i}>{x}</li>)}</ul>}</div>}
 
-            <AlternativeSection title="Креативное начало" subtitle="Три разных lead-in, каждый должен естественно запустить основную работу урока." kind="opening" items={lesson.creativeOptions?.opening} onApply={applyVariant}/>
-            <AlternativeSection title="Двигательная пауза" subtitle="Короткое движение без разрыва темы; для старших классов — без инфантильности." kind="movement" items={lesson.creativeOptions?.movement} onApply={applyVariant}/>
-            <AlternativeSection title="Рефлексия" subtitle="Варианты возвращают учащихся к цели и критериям успеха, а не только к эмоциям." kind="reflection" items={lesson.creativeOptions?.reflection} onApply={applyVariant}/>
+            <AlternativeSection title="Креативное начало" subtitle="Три разных lead-in, каждый должен естественно запустить основную работу урока." kind="opening" items={lesson.creativeOptions?.opening} onApply={applyVariant} onFavorite={markPreferredVariant} selectedKey={lesson.preferredVariants?.opening?.key}/>
+            <AlternativeSection title="Двигательная пауза" subtitle="Короткое движение без разрыва темы; для старших классов — без инфантильности." kind="movement" items={lesson.creativeOptions?.movement} onApply={applyVariant} onFavorite={markPreferredVariant} selectedKey={lesson.preferredVariants?.movement?.key}/>
+            <AlternativeSection title="Рефлексия" subtitle="Варианты возвращают учащихся к цели и критериям успеха, а не только к эмоциям." kind="reflection" items={lesson.creativeOptions?.reflection} onApply={applyVariant} onFavorite={markPreferredVariant} selectedKey={lesson.preferredVariants?.reflection?.key}/>
 
             <h3 className="result-title">Ход урока</h3>
             <div className="result-stages">{(lesson.stages || []).map((s, i) => <article className="stage-card" key={s.id || i}>
