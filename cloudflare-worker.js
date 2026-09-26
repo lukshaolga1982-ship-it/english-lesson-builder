@@ -1004,7 +1004,7 @@ export default {
         alibabaNativeBaseUrl: alibabaNativeBaseUrl(env),
         alibabaNativeEndpoint: alibabaNativeEndpoint(env),
         apiMode: "dashscope-native-multimodal",
-        workerVersion: "v20-worksheet-story",
+        workerVersion: "v21-stream-parser",
         corsMode: "simple-post-no-preflight",
         authTransport: "firebase-token-in-body-or-bearer",
         alibabaTransport: "dashscope-sse",

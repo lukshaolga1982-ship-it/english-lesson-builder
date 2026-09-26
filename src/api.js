@@ -20,7 +20,38 @@ async function apiRequest(path, user, body) {
       cache: 'no-store',
     });
 
-    const data = await response.json().catch(() => ({}));
+    // v21: Worker keeps long generations alive with whitespace heartbeats.
+    // Reading the response as text is more robust than Response.json() for a
+    // streamed body and also lets us surface the real server reply when JSON
+    // parsing fails instead of showing the misleading "HTTP 200" message.
+    const raw = await response.text();
+    const cleaned = String(raw || '').trim();
+    let data = null;
+
+    if (cleaned) {
+      try {
+        data = JSON.parse(cleaned);
+      } catch {
+        // Heartbeats are whitespace, but defensively extract the outer JSON
+        // object in case a proxy/browser inserted harmless text around it.
+        const firstBrace = cleaned.indexOf('{');
+        const lastBrace = cleaned.lastIndexOf('}');
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+          try { data = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)); } catch {}
+        }
+      }
+    }
+
+    if (!data || typeof data !== 'object') {
+      const preview = cleaned.slice(0, 500);
+      const err = new Error(preview
+        ? `Worker вернул ответ, который сайт не смог разобрать: ${preview}`
+        : `Worker вернул пустой ответ (HTTP ${response.status}).`);
+      err.code = 'INVALID_WORKER_RESPONSE';
+      err.status = response.status;
+      err.rawResponse = cleaned;
+      throw err;
+    }
 
     if (!response.ok || !data.ok) {
       const err = new Error(data.message || `Ошибка API: HTTP ${response.status}`);
