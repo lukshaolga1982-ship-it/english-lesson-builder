@@ -456,8 +456,55 @@ function normalizePrompt(body) {
   throw new Error("В запросе отсутствует prompt.");
 }
 
+function extractFirstJsonObject(text) {
+  let source = String(text || '').trim();
+  source = source.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+
+  const first = source.indexOf('{');
+  if (first < 0) throw new Error('Модель не вернула JSON-объект.');
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = first; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') depth += 1;
+    if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(first, i + 1);
+    }
+  }
+  throw new Error('JSON-ответ модели оборвался до закрывающей скобки.');
+}
+
 function safeJsonParse(text) {
-  try { return JSON.parse(text); } catch { return text; }
+  const candidate = extractFirstJsonObject(text);
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    const err = new Error(`Модель вернула некорректный JSON: ${error.message}`);
+    err.code = 'INVALID_MODEL_JSON';
+    err.raw = candidate;
+    throw err;
+  }
+}
+
+function addUsage(a, b) {
+  if (!a && !b) return null;
+  const fields = ['prompt_tokens', 'completion_tokens', 'total_tokens', 'input_tokens', 'output_tokens', 'reasoning_tokens'];
+  const out = {};
+  for (const field of fields) {
+    const value = Number(a?.[field] || 0) + Number(b?.[field] || 0);
+    if (value) out[field] = value;
+  }
+  return Object.keys(out).length ? out : (b || a || null);
 }
 
 function alibabaBaseUrl(env) {
@@ -520,52 +567,66 @@ function buildUsageSummary(usage, model, operation = "generate") {
   };
 }
 
+async function requestAlibabaText(env, model, messages, maxTokens = 8000) {
+  const response = await fetch(`${alibabaBaseUrl(env)}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${alibabaApiKey(env)}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      enable_thinking: false,
+      temperature: 0.2,
+      max_tokens: maxTokens,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(alibabaErrorMessage(data, response.status, model));
+    error.status = response.status;
+    error.code = data?.error?.code || data?.code || data?.error?.type || "";
+    throw error;
+  }
+  return data;
+}
+
 async function callAlibaba(env, prompt, systemPrompt) {
   const models = [String(env.QWEN_MODEL || PRIMARY_MODEL), FALLBACK_MODEL].filter(Boolean);
-  const apiKey = alibabaApiKey(env);
-  const baseUrl = alibabaBaseUrl(env);
   let lastError = null;
 
   for (const model of models) {
     try {
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: prompt },
-          ],
-          enable_thinking: false,
-          max_tokens: 8000,
-          response_format: { type: "json_object" },
-        }),
-      });
+      const messages = [
+        { role: "system", content: `${systemPrompt}\nВАЖНО: ответ должен быть одним валидным JSON-объектом. Не используй markdown-кодовые блоки и текст вне JSON.` },
+        { role: "user", content: prompt },
+      ];
+      let data = await requestAlibabaText(env, model, messages, 8000);
+      let usage = data.usage || null;
+      let content = data?.choices?.[0]?.message?.content || "";
 
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        const message = alibabaErrorMessage(data, response.status, model);
-        lastError = new Error(message);
-        lastError.status = response.status;
-        lastError.code = data?.error?.code || data?.code || data?.error?.type || "";
-        continue;
+      try {
+        const result = safeJsonParse(content);
+        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: false };
+      } catch (parseError) {
+        // One automatic retry without response_format. Asking for a shorter regeneration is
+        // more reliable than Alibaba json_object mode for large nested lesson plans.
+        const retryMessages = [
+          { role: "system", content: `${systemPrompt}\nВерни ТОЛЬКО один валидный JSON-объект. Без markdown и без текста до/после JSON. Сделай формулировки компактнее, но сохрани все обязательные поля.` },
+          { role: "user", content: `${prompt}\n\nПРЕДЫДУЩАЯ ПОПЫТКА НЕ ПРОШЛА JSON-ПРОВЕРКУ. Сгенерируй ответ заново целиком, короче и обязательно закрой все массивы/объекты.` },
+        ];
+        const retryData = await requestAlibabaText(env, model, retryMessages, 8000);
+        usage = addUsage(usage, retryData.usage || null);
+        content = retryData?.choices?.[0]?.message?.content || "";
+        const result = safeJsonParse(content);
+        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: true };
       }
-
-      const content = data?.choices?.[0]?.message?.content;
-      if (!content) {
-        lastError = new Error(`Alibaba Model Studio не вернул текст ответа для ${model}.`);
-        continue;
-      }
-      return { model, result: safeJsonParse(content), usage: data.usage || null, usageSummary: buildUsageSummary(data.usage || null, model, "generate") };
     } catch (error) {
       lastError = error;
     }
   }
-  throw lastError || new Error("Не удалось получить ответ от Alibaba Model Studio.");
+  throw lastError || new Error("Не удалось получить корректный JSON-ответ от Alibaba Model Studio.");
 }
 
 async function callAlibabaVisionOcr(env, images) {
@@ -580,43 +641,34 @@ async function callAlibabaVisionOcr(env, images) {
 - коротко опиши содержательно значимые иллюстрации в квадратных скобках, только если они нужны для выполнения задания.
 Не решай упражнения, не исправляй авторский текст, не переводи его и не придумывай пропущенное.
 Сохраняй порядок элементов сверху вниз. Для таблиц используй понятную текстовую структуру.
-Верни только JSON: {"pages":[{"label":"метка изображения","text":"распознанный текст"}]}. Порядок объектов должен совпадать с порядком изображений.`
+Верни только один валидный JSON-объект вида {"pages":[{"label":"метка изображения","text":"распознанный текст"}]}. Порядок объектов должен совпадать с порядком изображений. Без markdown.`
   }];
 
   for (const image of images) {
     content.push({ type: "text", text: `Метка следующего изображения: ${String(image.label || "страница").slice(0, 120)}` });
-    content.push({
-      type: "image_url",
-      image_url: { url: image.dataUrl },
-    });
+    content.push({ type: "image_url", image_url: { url: image.dataUrl } });
   }
 
   const model = String(env.QWEN_VISION_MODEL || env.QWEN_MODEL || VISION_MODEL);
-  const response = await fetch(`${alibabaBaseUrl(env)}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${alibabaApiKey(env)}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content }],
-      enable_thinking: false,
-      max_tokens: 8000,
-      response_format: { type: "json_object" },
-    }),
-  });
-
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(alibabaErrorMessage(data, response.status, model));
+  const messages = [{ role: "user", content }];
+  let data = await requestAlibabaText(env, model, messages, 8000);
+  let usage = data.usage || null;
+  let raw = data?.choices?.[0]?.message?.content || "";
+  let parsed;
+  let jsonRetry = false;
+  try {
+    parsed = safeJsonParse(raw);
+  } catch {
+    jsonRetry = true;
+    const retryContent = [...content, { type: "text", text: "Предыдущий ответ был невалидным JSON. Повтори распознавание и верни только один корректно закрытый JSON-объект без markdown." }];
+    const retryData = await requestAlibabaText(env, model, [{ role: "user", content: retryContent }], 8000);
+    usage = addUsage(usage, retryData.usage || null);
+    raw = retryData?.choices?.[0]?.message?.content || "";
+    parsed = safeJsonParse(raw);
   }
-
-  const raw = data?.choices?.[0]?.message?.content;
-  const parsed = safeJsonParse(raw || "");
   const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
   if (!pages.length) throw new Error("Alibaba Qwen не вернул распознанные страницы.");
-  return { model, pages, usage: data.usage || null, usageSummary: buildUsageSummary(data.usage || null, model, "ocr") };
+  return { model, pages, usage, usageSummary: buildUsageSummary(usage, model, "ocr"), jsonRetry };
 }
 
 async function handleOcrTextbookImages(request, env, user) {
@@ -730,6 +782,8 @@ export default {
         visionModel: VISION_MODEL,
         textbookImageOcr: true,
         thinkingEnabled: false,
+        structuredOutputMode: "worker-validated-json",
+        jsonAutoRetry: true,
       });
     }
 

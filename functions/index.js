@@ -116,33 +116,67 @@ async function loadTextbookContext(textbookId, pagesString) {
   return chunks.join('\n\n').slice(0,70000);
 }
 
-async function alibabaJson({ messages, schema }) {
-  const apiKey = DASHSCOPE_API_KEY.value();
-  const schemaHint = schema ? `\nТребуемая структура JSON: ${JSON.stringify(schema)}` : '';
-  const prepared = messages.map((m, index) => index === messages.length - 1
-    ? { ...m, content: `${m.content}${schemaHint}\nВерни только валидный JSON.` }
-    : m);
+function extractJsonObject(text) {
+  let source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  const first = source.indexOf('{');
+  if (first < 0) throw new Error('Qwen не вернул JSON.');
+  let depth = 0, inString = false, escaped = false;
+  for (let i = first; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{') depth += 1;
+    if (ch === '}' && --depth === 0) return source.slice(first, i + 1);
+  }
+  throw new Error('JSON Qwen оборвался.');
+}
 
+async function alibabaCompletion(messages) {
   const res = await fetch(`${ALIBABA_BASE_URL}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DASHSCOPE_API_KEY.value()}` },
     body: JSON.stringify({
       model: PRIMARY_MODEL,
-      messages: prepared,
+      messages,
       enable_thinking: false,
+      temperature: 0.2,
       max_tokens: 8000,
-      response_format: { type: 'json_object' },
     }),
   });
-  if (res.ok) {
-    const json = await res.json();
-    return JSON.parse(json.choices?.[0]?.message?.content || '{}');
+  if (!res.ok) {
+    const errorText = await res.text();
+    console.error('Alibaba Model Studio failed', `${res.status}: ${errorText}`);
+    if (res.status === 401 || res.status === 403) throw new HttpsError('internal', 'Alibaba API key отклонён. Проверьте DASHSCOPE_API_KEY и регион ключа.');
+    if (res.status === 429) throw new HttpsError('resource-exhausted', 'Alibaba Model Studio временно ограничил частоту запросов. Попробуйте ещё раз через минуту.');
+    throw new HttpsError('internal', 'Alibaba Qwen не смог сгенерировать ответ. Попробуйте ещё раз.');
   }
-  const errorText = await res.text();
-  console.error('Alibaba Model Studio failed', `${res.status}: ${errorText}`);
-  if (res.status === 401 || res.status === 403) throw new HttpsError('internal', 'Alibaba API key отклонён. Проверьте DASHSCOPE_API_KEY и регион ключа.');
-  if (res.status === 429) throw new HttpsError('resource-exhausted', 'Alibaba Model Studio временно ограничил частоту запросов. Попробуйте ещё раз через минуту.');
-  throw new HttpsError('internal', 'Alibaba Qwen не смог сгенерировать ответ. Попробуйте ещё раз.');
+  return res.json();
+}
+
+async function alibabaJson({ messages, schema }) {
+  const schemaHint = schema ? `\nТребуемая структура JSON: ${JSON.stringify(schema)}` : '';
+  const prepared = messages.map((m, index) => index === messages.length - 1
+    ? { ...m, content: `${m.content}${schemaHint}\nВерни только один валидный JSON-объект, без markdown и текста вокруг.` }
+    : m);
+
+  let response = await alibabaCompletion(prepared);
+  let raw = response.choices?.[0]?.message?.content || '';
+  try {
+    return JSON.parse(extractJsonObject(raw));
+  } catch {
+    const retry = prepared.map((m, index) => index === prepared.length - 1
+      ? { ...m, content: `${m.content}\nПредыдущая попытка была невалидным JSON. Сгенерируй ответ заново целиком, короче, и обязательно закрой все массивы и объекты.` }
+      : m);
+    response = await alibabaCompletion(retry);
+    raw = response.choices?.[0]?.message?.content || '';
+    try { return JSON.parse(extractJsonObject(raw)); }
+    catch { throw new HttpsError('internal', 'Qwen дважды вернул некорректный JSON. Попробуйте повторить генерацию.'); }
+  }
 }
 
 function systemPrompt() {

@@ -255,3 +255,11 @@ Cloudflare Worker ожидает секрет `DASHSCOPE_API_KEY`. Старый 
 5. Сохраните и задеплойте обновлённый `cloudflare-worker.js`.
 
 Alibaba Model Studio тарифицируется отдельно. Для API используется собственная квота/биллинг Alibaba Cloud.
+
+## v11 — Alibaba JSON stability fix
+
+- Для длинных планов больше не используется `response_format: {type: "json_object"}`.
+- Qwen работает с `enable_thinking: false` и обычным text output.
+- Worker самостоятельно извлекает и валидирует JSON-объект.
+- Если JSON оборвался или не парсится, Worker автоматически повторяет генерацию один раз с более жёсткой и компактной инструкцией.
+- OCR фото страниц использует ту же схему проверки и автоматического повтора.
