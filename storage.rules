@@ -1,0 +1,12 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Учебники доступны только пользователям, вошедшим через Firebase Auth.
+    // Загрузка/изменение файлов из самого сайта запрещены; администратор
+    // по-прежнему может управлять файлами через Firebase Console.
+    match /{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+  }
+}

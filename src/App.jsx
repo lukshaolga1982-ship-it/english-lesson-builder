@@ -18,6 +18,7 @@ import { generateLesson, refineLessonStage } from './api';
 import {
   buildTextbookCacheId, loadTextbookPagesFromFirestore, manualTextbookContext,
   obtainTextbookPagesAutomatically, obtainTextbookPagesFromImages, obtainTextbookPagesFromUploadedPdf, parsePageNumbers,
+  saveTextbookPageCalibration,
 } from './textbookSource';
 import './styles.css';
 
@@ -148,6 +149,8 @@ export default function App() {
   const [uploadedPdfFile, setUploadedPdfFile] = useState(null);
   const [uploadedTextbookSource, setUploadedTextbookSource] = useState(null);
   const [usageSummary, setUsageSummary] = useState(null);
+  const [pageCalibrationRequest, setPageCalibrationRequest] = useState(null);
+  const [calibrationPrintedPage, setCalibrationPrintedPage] = useState('');
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
   useEffect(() => {
@@ -167,6 +170,8 @@ export default function App() {
   const clearProcessedTextbookSource = () => {
     setUploadedTextbookSource(null);
     setActiveTextbookContext('');
+    setPageCalibrationRequest(null);
+    setCalibrationPrintedPage('');
     setTextbookSourceStatus({ state: 'idle', message: '' });
   };
 
@@ -177,6 +182,8 @@ export default function App() {
     setUploadedTextbookSource(null);
     setUploadedPageImages([]);
     setUploadedPdfFile(null);
+    setPageCalibrationRequest(null);
+    setCalibrationPrintedPage('');
     setTextbookSourceStatus({ state: 'idle', message: '' });
     setForm((f) => ({ ...f, grade, textbookId: first?.id || '', customTextbook: '' }));
   };
@@ -195,6 +202,53 @@ export default function App() {
   async function login() {
     try { await signInWithPopup(auth, googleProvider); }
     catch (e) { setNotice(`Не удалось войти: ${e.message}`); }
+  }
+
+  function showCalibrationRequest(error) {
+    const calibration = error?.calibration || null;
+    if (!calibration) return false;
+    setPageCalibrationRequest(calibration);
+    setCalibrationPrintedPage('');
+    setActiveTextbookContext('');
+    setTextbookSourceStatus({
+      state: 'calibration',
+      message: `Нужно один раз привязать нумерацию этой части учебника. На превью показана PDF-страница ${calibration.pdfPage}; введите напечатанный на ней номер страницы.`,
+    });
+    return true;
+  }
+
+  async function confirmPageCalibration() {
+    if (!user || !pageCalibrationRequest) return;
+    const printedPage = Number(calibrationPrintedPage);
+    if (!Number.isFinite(printedPage) || printedPage < 1) {
+      setNotice('Введите напечатанный номер страницы с превью.');
+      return;
+    }
+    setBusy(true);
+    setNotice('');
+    try {
+      await saveTextbookPageCalibration({
+        db,
+        user,
+        textbookId: pageCalibrationRequest.textbookId || textbookCacheId,
+        part: pageCalibrationRequest.part || form.part || '1',
+        pdfPage: pageCalibrationRequest.pdfPage,
+        printedPage,
+        sourceKey: pageCalibrationRequest.sourceKey || '',
+        sourceName: pageCalibrationRequest.sourceName || '',
+        mode: 'manual',
+      });
+      const origin = pageCalibrationRequest.origin || 'automatic';
+      setPageCalibrationRequest(null);
+      setCalibrationPrintedPage('');
+      setTextbookSourceStatus({ state: 'checking', message: 'Привязка сохранена. Повторно читаю нужные страницы…' });
+      if (origin === 'uploaded-pdf' && uploadedPdfFile) await processUploadedPdf();
+      else await resolveTextbookSource({ strict: false });
+    } catch (error) {
+      setNotice(`Не удалось сохранить привязку: ${error?.message || error}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function resolveTextbookSource({ strict = false } = {}) {
@@ -243,7 +297,7 @@ export default function App() {
       return { text: '', requestedPages, loadedPages: [], missingPages: requestedPages, source: 'automatic' };
     }
 
-    setTextbookSourceStatus({ state: 'checking', message: 'Проверяю кэш и получаю страницы учебника автоматически…' });
+    setTextbookSourceStatus({ state: 'checking', message: 'Проверяю кэш и библиотеку Firebase Storage…' });
     try {
       const loaded = await obtainTextbookPagesAutomatically({
         db,
@@ -265,6 +319,10 @@ export default function App() {
       throw new Error(`Не удалось получить стр. ${loaded.missingPages.join(', ') || form.pages}.`);
     } catch (error) {
       setActiveTextbookContext('');
+      if (error?.code === 'PAGE_CALIBRATION_REQUIRED' && showCalibrationRequest(error)) {
+        if (strict) throw error;
+        return { text: '', requestedPages, loadedPages: [], missingPages: requestedPages, source: 'calibration' };
+      }
       const message = error?.message || 'Не удалось автоматически получить страницы учебника.';
       setTextbookSourceStatus({ state: 'missing', message });
       if (strict) throw error;
@@ -296,6 +354,8 @@ export default function App() {
       setUploadedTextbookSource(ready);
       setActiveTextbookContext(loaded.text);
       setManualTextbookText('');
+      setPageCalibrationRequest(null);
+      setCalibrationPrintedPage('');
       setTextbookSourceStatus({ state: 'ready', message });
     } catch (error) {
       setTextbookSourceStatus({ state: 'missing', message: error?.message || 'Не удалось распознать фото страниц.' });
@@ -318,8 +378,11 @@ export default function App() {
       setUploadedTextbookSource(ready);
       setActiveTextbookContext(loaded.text);
       setManualTextbookText('');
+      setPageCalibrationRequest(null);
+      setCalibrationPrintedPage('');
       setTextbookSourceStatus({ state: 'ready', message });
     } catch (error) {
+      if (error?.code === 'PAGE_CALIBRATION_REQUIRED' && showCalibrationRequest(error)) return;
       setTextbookSourceStatus({ state: 'missing', message: error?.message || 'Не удалось прочитать PDF учебника.' });
     }
   }
@@ -384,6 +447,9 @@ export default function App() {
       if (e?.code === 'DAILY_LIMIT') {
         setRemaining(0);
         setNotice('Лимит: 5 полных генераций на сегодня уже использованы.');
+      } else if (e?.code === 'PAGE_CALIBRATION_REQUIRED') {
+        setStep(0);
+        setNotice('Нужно один раз сопоставить нумерацию PDF и печатных страниц. Я открыла форму привязки на первом шаге.');
       } else if (/tokens per minute|\bTPM\b|Request too large for model/i.test(msg)) {
         setNotice('Alibaba Qwen отклонил запрос из-за лимита или размера. Попробуйте ещё раз через минуту; если ошибка повторится, уменьшите количество страниц учебника в одной генерации.');
       } else {
@@ -482,7 +548,7 @@ export default function App() {
             </div>
             <div className="grid two">
               <Field label="Учебник" wide>
-                <select value={form.textbookId} onChange={(e) => { update('textbookId', e.target.value); setManualTextbookText(''); setUploadedTextbookSource(null); setUploadedPageImages([]); setUploadedPdfFile(null); setActiveTextbookContext(''); setTextbookSourceStatus({ state: 'idle', message: '' }); }}>{books.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}</select>
+                <select value={form.textbookId} onChange={(e) => { update('textbookId', e.target.value); setManualTextbookText(''); setUploadedTextbookSource(null); setUploadedPageImages([]); setUploadedPdfFile(null); setActiveTextbookContext(''); setPageCalibrationRequest(null); setCalibrationPrintedPage(''); setTextbookSourceStatus({ state: 'idle', message: '' }); }}>{books.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}</select>
                 <div className="textbook-resource-row">
                   <div className="textbook-resource-copy">
                     <b>Сверить страницы учебника</b>
@@ -503,15 +569,29 @@ export default function App() {
             </div>
             <div className={`textbook-source-panel ${textbookSourceStatus.state || 'idle'}`}>
               <div className="textbook-source-head">
-                <div><b>Страницы учебника</b><span>Сайт сам попробует получить PDF, прочитать указанные страницы и сохранить их в вашем кэше. Вручную скачивать учебник не нужно.</span></div>
+                <div><b>Страницы учебника</b><span>Сайт сначала берёт PDF из вашей библиотеки Firebase Storage, читает только указанные страницы и сохраняет их текст в личном кэше. Фото страниц и ручная загрузка PDF остаются как запасной вариант.</span></div>
                 <button type="button" className="secondary" onClick={checkTextbookSource} disabled={!form.pages.trim() || textbookSourceStatus.state === 'checking' || currentBook?.custom}>
                   {textbookSourceStatus.state === 'checking' ? <RefreshCw size={14} className="spin"/> : <BookOpen size={14}/>} Получить страницы
                 </button>
               </div>
               {textbookSourceStatus.message && <div className="textbook-source-status">{textbookSourceStatus.message}</div>}
 
+              {pageCalibrationRequest && <div className="page-calibration-card">
+                <div className="page-calibration-head"><Link2 size={18}/><div><b>Один раз сопоставьте нумерацию</b><p>PDF может начинаться с обложки или продолжать нумерацию со второй части. После одной привязки сайт сам рассчитает все остальные страницы.</p></div></div>
+                <div className="page-calibration-grid">
+                  {pageCalibrationRequest.previewDataUrl && <div className="page-calibration-preview"><img src={pageCalibrationRequest.previewDataUrl} alt={`PDF-страница ${pageCalibrationRequest.pdfPage}`}/><span>PDF-страница {pageCalibrationRequest.pdfPage}{pageCalibrationRequest.totalPdfPages ? ` из ${pageCalibrationRequest.totalPdfPages}` : ''}</span></div>}
+                  <div className="page-calibration-form">
+                    <div className="calibration-source"><span>Файл</span><b>{pageCalibrationRequest.sourceName || currentBook?.label || 'Учебник'}</b></div>
+                    <p>Посмотрите на номер страницы, напечатанный в самом учебнике на превью, и введите его ниже.</p>
+                    <label><span>На PDF-странице {pageCalibrationRequest.pdfPage} напечатан номер:</span><input type="number" min="1" step="1" value={calibrationPrintedPage} onChange={(e) => setCalibrationPrintedPage(e.target.value)} placeholder="Например, 3"/></label>
+                    <button type="button" className="primary" onClick={confirmPageCalibration} disabled={busy || !calibrationPrintedPage}><Check size={15}/> Сохранить привязку и продолжить</button>
+                    <small>Привязка сохранится только для этой части учебника. Фото страниц по-прежнему можно использовать вместо PDF.</small>
+                  </div>
+                </div>
+              </div>}
+
               <div className="textbook-upload-area">
-                <div className="textbook-upload-heading"><Upload size={17}/><div><b>Добавить материал самостоятельно</b><span>Можно загрузить фото нужных страниц или целый PDF учебника. Сайт извлечёт только страницы, указанные выше.</span></div></div>
+                <div className="textbook-upload-heading"><Upload size={17}/><div><b>Добавить материал самостоятельно</b><span>Фото страниц оставлены: их можно использовать, если нужного PDF нет в библиотеке, страница является сканом или нужно дать модели конкретный разворот.</span></div></div>
                 <div className="textbook-upload-grid">
                   <div className="upload-source-card">
                     <div className="upload-source-icon"><ImagePlus size={20}/></div>
@@ -531,7 +611,7 @@ export default function App() {
               </div>
 
               <Field label="Ещё один вариант — вставить текст вручную" hint="Вставленный текст имеет приоритет над автоматическим источником, фото и PDF." wide>
-                <textarea rows={5} value={manualTextbookText} onChange={(e) => { setManualTextbookText(e.target.value); setUploadedTextbookSource(null); setActiveTextbookContext(''); setTextbookSourceStatus({ state: e.target.value.trim() ? 'ready' : 'idle', message: e.target.value.trim() ? `Будет использован вставленный текст для стр. ${form.pages || 'указанных страниц'}.` : '' }); }} placeholder="Вставьте текст упражнений, диалогов, правил и заданий с выбранных страниц…"/>
+                <textarea rows={5} value={manualTextbookText} onChange={(e) => { setManualTextbookText(e.target.value); setUploadedTextbookSource(null); setActiveTextbookContext(''); setPageCalibrationRequest(null); setCalibrationPrintedPage(''); setTextbookSourceStatus({ state: e.target.value.trim() ? 'ready' : 'idle', message: e.target.value.trim() ? `Будет использован вставленный текст для стр. ${form.pages || 'указанных страниц'}.` : '' }); }} placeholder="Вставьте текст упражнений, диалогов, правил и заданий с выбранных страниц…"/>
               </Field>
             </div>
             <Field label="Тема урока" wide hint={`В документе: ${titlePreview}`}><input className="large-input" value={form.topic} onChange={(e) => update('topic', e.target.value)} placeholder="Например: Mass Media"/></Field>
@@ -575,7 +655,7 @@ export default function App() {
               <Field label="Домашнее задание"><select value={form.homeworkMode} onChange={(e) => update('homeworkMode', e.target.value)}><option>Сгенерировать</option><option>Ввести самостоятельно</option></select></Field>
               {form.homeworkMode === 'Ввести самостоятельно' && <Field label="Текст домашнего задания"><input value={form.homework} onChange={(e) => update('homework', e.target.value)}/></Field>}
             </div>
-            <div className="info-box"><b>Учебник и страницы</b><p>Если указаны страницы, генерация теперь требует их фактический текст: из Firestore или из поля на шаге 1. Без текста сайт не будет создавать план «по страницам» наугад.</p></div>
+            <div className="info-box"><b>Учебник и страницы</b><p>Если указаны страницы, сайт берёт их фактический текст из кэша, Firebase Storage, фото/PDF или ручного текста. Если нумерация PDF отличается от печатной, привязка определяется автоматически или запрашивается один раз.</p></div>
           </>}
 
           {step === 3 && !lesson && <>

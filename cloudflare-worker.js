@@ -94,10 +94,25 @@ const TEXTBOOK_SOURCES = {
   },
 };
 
+function isSafeCorsOrigin(origin) {
+  if (!origin) return true;
+  try {
+    const url = new URL(origin);
+    if (url.protocol === "https:") return true;
+    if (url.protocol === "http:" && ["localhost", "127.0.0.1"].includes(url.hostname)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function corsHeaders(request) {
   const origin = request.headers.get("Origin");
-  const allowed = origin && ALLOWED_ORIGINS.has(origin)
-    ? origin
+  // The API uses Firebase Bearer tokens, not cross-site cookies. Echoing a valid
+  // HTTPS origin makes GitHub Pages, Firebase Hosting and custom domains work
+  // without silently turning server errors into browser-level "Failed to fetch".
+  const allowed = isSafeCorsOrigin(origin)
+    ? (origin || "*")
     : "https://lukshaolga1982-ship-it.github.io";
 
   return {
@@ -614,24 +629,41 @@ function extractNativeContent(data) {
 }
 
 async function requestAlibabaNative(env, model, messages, maxTokens = 8000, temperature = 0.2) {
-  const response = await fetch(alibabaNativeEndpoint(env), {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${alibabaApiKey(env)}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      input: { messages: messages.map(normalizeNativeMessage) },
-      parameters: {
-        result_format: "message",
-        enable_thinking: false,
-        temperature,
-        max_tokens: maxTokens,
-      },
-    }),
-  });
-  const data = await response.json().catch(() => ({}));
+  let response;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort("ALIBABA_TIMEOUT"), 90000);
+    try {
+      response = await fetch(alibabaNativeEndpoint(env), {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${alibabaApiKey(env)}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          input: { messages: messages.map(normalizeNativeMessage) },
+          parameters: {
+            result_format: "message",
+            enable_thinking: false,
+            temperature,
+            max_tokens: maxTokens,
+          },
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (error) {
+    const suffix = error?.name === "AbortError"
+      ? "Alibaba не ответил за 90 секунд."
+      : (error?.message || String(error));
+    const wrapped = new Error(`Не удалось связаться с Alibaba Model Studio: ${suffix}`);
+    wrapped.code = "ALIBABA_NETWORK_ERROR";
+    throw wrapped;
+  }
+  const data = await response.json().catch(async () => ({ raw: await response.text().catch(() => "") }));
   if (!response.ok || data?.code) {
     const error = new Error(alibabaErrorMessage(data, response.status || 400, model));
     error.status = response.status;
@@ -814,6 +846,15 @@ export default {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
     const url = new URL(request.url);
 
+    if (request.method === "GET" && url.pathname === "/cors-test") {
+      return jsonResponse(request, {
+        ok: true,
+        service: "Smart Lesson CORS test",
+        receivedOrigin: request.headers.get("Origin") || null,
+        accessControlAllowOrigin: corsHeaders(request)["Access-Control-Allow-Origin"],
+      });
+    }
+
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return jsonResponse(request, {
         ok: true,
@@ -822,6 +863,8 @@ export default {
         alibabaNativeBaseUrl: alibabaNativeBaseUrl(env),
         alibabaNativeEndpoint: alibabaNativeEndpoint(env),
         apiMode: "dashscope-native-multimodal",
+        workerVersion: "v13-network-cors",
+        corsMode: "echo-valid-https-origin",
         kvConfigured: Boolean(env.USAGE_LIMITS),
         automaticTextbooks: Object.keys(TEXTBOOK_SOURCES),
         primaryModel: PRIMARY_MODEL,

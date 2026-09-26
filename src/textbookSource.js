@@ -1,4 +1,7 @@
 import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore';
+import { getBytes, listAll, ref as storageRef } from 'firebase/storage';
+import { storage } from './firebase';
+import { storageTextbookFiles } from './textbooks';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
@@ -51,6 +54,67 @@ export function buildTextbookCacheId(textbookId, customTitle = '') {
 
 function cacheDocId(bookId, part, printedPage) {
   return `${bookId}__part-${String(part || '1').replace(/[^a-zA-Z0-9_-]/g, '_')}__page-${printedPage}`;
+}
+
+function calibrationDocId(bookId, part) {
+  return `${bookId}__part-${String(part || '1').replace(/[^a-zA-Z0-9_-]/g, '_')}__calibration`;
+}
+
+async function loadUserPageCalibration(db, uid, bookId, part, sourceKey = '') {
+  if (!uid) return null;
+  try {
+    const snap = await getDoc(doc(db, 'users', uid, 'textbookCache', calibrationDocId(bookId, part)));
+    if (!snap.exists()) return null;
+    const data = snap.data() || {};
+    const pdfPage = Number(data.pdfPage);
+    const printedPage = Number(data.printedPage);
+    if (!Number.isFinite(pdfPage) || pdfPage < 1 || !Number.isFinite(printedPage) || printedPage < 1) return null;
+    const savedSourceKey = String(data.sourceKey || '');
+    if (savedSourceKey && sourceKey && savedSourceKey !== sourceKey) return null;
+    return {
+      pdfPage,
+      printedPage,
+      offset: pdfPage - printedPage,
+      sourceKey: savedSourceKey,
+      sourceName: String(data.sourceName || ''),
+      mode: String(data.mode || 'manual'),
+    };
+  } catch (error) {
+    console.warn('Не удалось прочитать привязку нумерации PDF', error);
+    return null;
+  }
+}
+
+export async function saveTextbookPageCalibration({
+  db,
+  user,
+  textbookId,
+  part = '1',
+  pdfPage,
+  printedPage,
+  sourceKey = '',
+  sourceName = '',
+  mode = 'manual',
+}) {
+  if (!user?.uid) throw new Error('Чтобы сохранить привязку страниц, войдите через Google.');
+  const pdf = Number(pdfPage);
+  const printed = Number(printedPage);
+  if (!Number.isFinite(pdf) || pdf < 1 || !Number.isFinite(printed) || printed < 1) {
+    throw new Error('Укажите корректный номер PDF-страницы и напечатанный номер страницы.');
+  }
+  await setDoc(doc(db, 'users', user.uid, 'textbookCache', calibrationDocId(textbookId, part)), {
+    kind: 'page-calibration',
+    bookId: textbookId,
+    part: String(part || '1'),
+    pdfPage: pdf,
+    printedPage: printed,
+    offset: pdf - printed,
+    sourceKey: String(sourceKey || ''),
+    sourceName: String(sourceName || ''),
+    mode,
+    updatedAt: serverTimestamp(),
+  }, { merge: true });
+  return { pdfPage: pdf, printedPage: printed, offset: pdf - printed, sourceKey, sourceName, mode };
 }
 
 async function loadUserCachedPage(db, uid, bookId, part, page) {
@@ -156,6 +220,80 @@ export async function loadTextbookPagesFromFirestore(db, textbookId, pagesString
   }));
 
   return buildContext(loaded, pages, 'firestore');
+}
+
+
+let storageRootPromise = null;
+
+function normalizeStorageName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+async function listStorageRootFiles() {
+  if (!storageRootPromise) {
+    storageRootPromise = listAll(storageRef(storage)).catch((error) => {
+      storageRootPromise = null;
+      throw error;
+    });
+  }
+  const result = await storageRootPromise;
+  return result.items || [];
+}
+
+function resolveStorageRule(textbookId, part = '1') {
+  const rules = storageTextbookFiles?.[textbookId] || {};
+  return rules[String(part || '1')] || rules['1'] || null;
+}
+
+async function findStorageTextbookRef(textbookId, part = '1') {
+  const rule = resolveStorageRule(textbookId, part);
+  if (!rule) return null;
+  const items = await listStorageRootFiles();
+  const exactNames = new Set((rule.exact || []).map(normalizeStorageName));
+  let found = items.find((item) => exactNames.has(normalizeStorageName(item.name)));
+  if (found) return found;
+
+  const tokens = (rule.tokens || []).map(normalizeStorageName).filter(Boolean);
+  if (tokens.length) {
+    found = items.find((item) => {
+      const name = normalizeStorageName(item.name);
+      return tokens.every((token) => name.includes(token));
+    });
+  }
+  return found || null;
+}
+
+async function downloadTextbookPdfFromStorage(textbookId, part = '1', onProgress) {
+  onProgress?.('Ищу учебник в Firebase Storage…');
+  let fileRef;
+  try {
+    fileRef = await findStorageTextbookRef(textbookId, part);
+  } catch (error) {
+    const code = String(error?.code || '');
+    if (code.includes('unauthorized')) {
+      throw new Error('Firebase Storage не разрешил чтение учебников. Проверьте Storage Rules: авторизованным пользователям нужен read-доступ к PDF.');
+    }
+    throw new Error(`Не удалось открыть библиотеку Firebase Storage: ${error?.message || error}`);
+  }
+  if (!fileRef) throw new Error(`PDF выбранного учебника (часть ${part}) не найден в Firebase Storage.`);
+
+  onProgress?.(`Загружаю ${fileRef.name} из Firebase Storage…`);
+  try {
+    const buffer = await getBytes(fileRef, 100 * 1024 * 1024);
+    return {
+      buffer,
+      sourceName: fileRef.name,
+      sourceType: 'firebase-storage',
+      sourceUrl: `gs://${storage.app.options.storageBucket}/${fileRef.fullPath}`,
+      storagePath: fileRef.fullPath,
+    };
+  } catch (error) {
+    const code = String(error?.code || '');
+    if (code.includes('unauthorized')) {
+      throw new Error('Firebase Storage не разрешил скачать PDF. Проверьте Storage Rules для авторизованных пользователей.');
+    }
+    throw new Error(`Не удалось скачать PDF из Firebase Storage: ${error?.message || error}`);
+  }
 }
 
 async function authorizedFetch(user, path, body, { binary = false, timeoutMs = 120000 } = {}) {
@@ -265,34 +403,81 @@ async function extractPdfPage(pdf, pdfPageNumber) {
   return { page, items, text };
 }
 
-function pageNumberScore(items, printedPage, viewportHeight) {
-  const target = String(printedPage);
-  let score = 0;
+function pageNumberCandidates(items, viewportHeight) {
+  const out = [];
   for (const item of items || []) {
     const token = normalizeToken(item.str).replace(/[.·•]/g, '');
-    if (token !== target) continue;
+    if (!/^\d{1,3}$/.test(token)) continue;
+    const printedPage = Number(token);
+    if (!Number.isFinite(printedPage) || printedPage < 1 || printedPage > 500) continue;
     const y = itemY(item);
-    if (viewportHeight && y < viewportHeight * 0.14) score += 12;
-    else if (viewportHeight && y > viewportHeight * 0.86) score += 6;
-    else score += 1;
+    let score = 0;
+    // PDF coordinates start at the bottom. Page numbers are usually in the bottom or top margin.
+    if (viewportHeight && y < viewportHeight * 0.16) score = 12;
+    else if (viewportHeight && y > viewportHeight * 0.88) score = 8;
+    else continue;
+    out.push({ printedPage, score });
   }
-  return score;
+  return out;
 }
 
-async function detectPrintedPageOffset(pdf, printedPage, onProgress) {
-  const start = Math.max(1, printedPage - 2);
-  const end = Math.min(pdf.numPages, printedPage + 14);
-  let best = null;
-  for (let pdfPage = start; pdfPage <= end; pdfPage += 1) {
-    onProgress?.(`Определяю соответствие страниц… ${pdfPage - start + 1}/${end - start + 1}`);
+async function detectPrintedPageCalibration(pdf, onProgress) {
+  const scanCount = Math.min(pdf.numPages, 32);
+  const clusters = new Map();
+  for (let pdfPage = 1; pdfPage <= scanCount; pdfPage += 1) {
+    onProgress?.(`Определяю нумерацию учебника… ${pdfPage}/${scanCount}`);
     const page = await pdf.getPage(pdfPage);
     const viewport = page.getViewport({ scale: 1 });
     const content = await page.getTextContent({ includeMarkedContent: false });
-    const score = pageNumberScore(content.items || [], printedPage, viewport.height);
-    if (score > 0 && (!best || score > best.score)) best = { pdfPage, score, offset: pdfPage - printedPage };
-    if (score >= 12) break;
+    const candidates = pageNumberCandidates(content.items || [], viewport.height);
+    for (const candidate of candidates) {
+      const offset = pdfPage - candidate.printedPage;
+      const key = String(offset);
+      if (!clusters.has(key)) clusters.set(key, { offset, score: 0, matches: [] });
+      const cluster = clusters.get(key);
+      if (!cluster.matches.some((m) => m.pdfPage === pdfPage)) {
+        cluster.matches.push({ pdfPage, printedPage: candidate.printedPage, score: candidate.score });
+        cluster.score += candidate.score;
+      }
+    }
   }
-  return best?.offset ?? null;
+
+  const ranked = [...clusters.values()]
+    .map((cluster) => {
+      const pages = cluster.matches.map((m) => m.pdfPage).sort((a, b) => a - b);
+      let consecutive = 0;
+      for (let i = 1; i < pages.length; i += 1) if (pages[i] === pages[i - 1] + 1) consecutive += 1;
+      return { ...cluster, confidence: cluster.score + consecutive * 10 + cluster.matches.length * 4 };
+    })
+    .sort((a, b) => b.confidence - a.confidence);
+
+  const best = ranked[0];
+  if (!best || best.matches.length < 2 || best.confidence < 30) return null;
+  const anchor = best.matches.sort((a, b) => b.score - a.score || a.pdfPage - b.pdfPage)[0];
+  return {
+    pdfPage: anchor.pdfPage,
+    printedPage: anchor.printedPage,
+    offset: best.offset,
+    confidence: best.confidence,
+    matches: best.matches.length,
+    mode: 'auto',
+  };
+}
+
+async function chooseCalibrationPreviewPage(pdf) {
+  const end = Math.min(pdf.numPages, 20);
+  let best = null;
+  for (let pdfPage = 1; pdfPage <= end; pdfPage += 1) {
+    const extracted = await extractPdfPage(pdf, pdfPage);
+    const viewport = extracted.page.getViewport({ scale: 1 });
+    const candidates = pageNumberCandidates(extracted.items || [], viewport.height);
+    const textLength = String(extracted.text || '').replace(/\s/g, '').length;
+    // Prefer a content page where a page-like number is actually visible in a margin.
+    const candidateBonus = candidates.length ? 10000 + Math.max(...candidates.map((x) => x.score)) * 100 : 0;
+    const score = candidateBonus + textLength + (pdfPage >= 4 ? 80 : 0);
+    if (!best || score > best.score) best = { pdfPage, page: extracted.page, score };
+  }
+  return best || { pdfPage: 1, page: await pdf.getPage(1), score: 0 };
 }
 
 async function renderPdfPageToDataUrl(page) {
@@ -305,6 +490,19 @@ async function renderPdfPageToDataUrl(page) {
   canvas.height = Math.ceil(viewport.height);
   await page.render({ canvasContext: ctx, viewport, background: '#ffffff' }).promise;
   return canvas.toDataURL('image/jpeg', IMAGE_JPEG_QUALITY);
+}
+
+async function renderCalibrationPreviewDataUrl(page) {
+  const baseViewport = page.getViewport({ scale: 1 });
+  const previewMaxSide = 1050;
+  const scale = Math.min(1.8, Math.max(0.9, previewMaxSide / Math.max(baseViewport.width, baseViewport.height)));
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  await page.render({ canvasContext: ctx, viewport, background: '#ffffff' }).promise;
+  return canvas.toDataURL('image/jpeg', 0.76);
 }
 
 function readFileAsDataUrl(file) {
@@ -356,31 +554,57 @@ async function ocrDataUrl(user, dataUrl, label, onProgress) {
   return String(first?.text || '').trim();
 }
 
-async function extractRequestedPagesFromPdf(buffer, printedPages, { onProgress, user = null, ocrFallback = false } = {}) {
+async function extractRequestedPagesFromPdf(buffer, printedPages, {
+  onProgress,
+  user = null,
+  ocrFallback = false,
+  calibration = null,
+} = {}) {
   onProgress?.('Открываю PDF и читаю выбранные страницы…');
   const task = pdfjsLib.getDocument({ data: new Uint8Array(buffer), disableFontFace: true, useSystemFonts: true });
   const pdf = await task.promise;
   if (!pdf?.numPages) throw new Error('Не удалось прочитать PDF учебника.');
 
-  const firstPrinted = printedPages[0];
-  let offset = await detectPrintedPageOffset(pdf, firstPrinted, onProgress);
-  if (offset == null) {
-    let best = null;
-    for (const candidateOffset of [0, 1, 2, 3, 4, 5, 6]) {
-      const pdfPage = firstPrinted + candidateOffset;
-      if (pdfPage < 1 || pdfPage > pdf.numPages) continue;
-      const extracted = await extractPdfPage(pdf, pdfPage);
-      const score = extracted.text.replace(/\s/g, '').length;
-      if (!best || score > best.score) best = { offset: candidateOffset, score };
-    }
-    offset = best?.offset ?? 0;
+  let resolvedCalibration = calibration && Number.isFinite(Number(calibration.pdfPage)) && Number.isFinite(Number(calibration.printedPage))
+    ? {
+        ...calibration,
+        pdfPage: Number(calibration.pdfPage),
+        printedPage: Number(calibration.printedPage),
+        offset: Number(calibration.pdfPage) - Number(calibration.printedPage),
+        mode: calibration.mode || 'saved',
+      }
+    : null;
+
+  if (!resolvedCalibration) {
+    resolvedCalibration = await detectPrintedPageCalibration(pdf, onProgress);
   }
 
+  if (!resolvedCalibration) {
+    onProgress?.('Не удалось уверенно определить нумерацию автоматически. Нужна одна привязка.');
+    const preview = await chooseCalibrationPreviewPage(pdf);
+    const previewDataUrl = await renderCalibrationPreviewDataUrl(preview.page);
+    const error = new Error(`Один раз укажите напечатанный номер страницы, показанной на превью (PDF-страница ${preview.pdfPage}). После этого сайт сам рассчитает все остальные страницы этой части учебника.`);
+    error.code = 'PAGE_CALIBRATION_REQUIRED';
+    error.calibration = {
+      pdfPage: preview.pdfPage,
+      totalPdfPages: pdf.numPages,
+      previewDataUrl,
+    };
+    try { await pdf.destroy(); } catch {}
+    throw error;
+  }
+
+  const offset = Number(resolvedCalibration.offset);
   const results = [];
   for (let i = 0; i < printedPages.length; i += 1) {
     const printedPage = printedPages[i];
     const pdfPage = printedPage + offset;
-    if (pdfPage < 1 || pdfPage > pdf.numPages) throw new Error(`Страница ${printedPage} выходит за пределы PDF.`);
+    if (pdfPage < 1 || pdfPage > pdf.numPages) {
+      const error = new Error(`По сохранённой привязке печатная стр. ${printedPage} соответствует PDF-странице ${pdfPage}, которой нет в файле. Проверьте привязку нумерации.`);
+      error.code = 'PAGE_CALIBRATION_INVALID';
+      try { await pdf.destroy(); } catch {}
+      throw error;
+    }
     onProgress?.(`Читаю стр. ${printedPage}… ${i + 1}/${printedPages.length}`);
     const extracted = await extractPdfPage(pdf, pdfPage);
     let clean = String(extracted.text || '').trim();
@@ -392,13 +616,14 @@ async function extractRequestedPagesFromPdf(buffer, printedPages, { onProgress, 
     }
 
     if (clean.length < 20) {
+      try { await pdf.destroy(); } catch {}
       throw new Error(`На стр. ${printedPage} не удалось извлечь достаточно текста. Загрузите фото этой страницы — сайт распознает её через OCR.`);
     }
     results.push({ page: printedPage, pdfPage, text: clean });
   }
 
   try { await pdf.destroy(); } catch {}
-  return { pages: results, offset };
+  return { pages: results, offset, calibration: resolvedCalibration };
 }
 
 export async function obtainTextbookPagesAutomatically({
@@ -421,8 +646,65 @@ export async function obtainTextbookPagesAutomatically({
   }
 
   const missing = cached.missingPages.length ? cached.missingPages : requestedPages;
-  const pdf = await downloadTextbookPdf(user, textbookId, part, onProgress);
-  const extracted = await extractRequestedPagesFromPdf(pdf.buffer, missing, { onProgress, user, ocrFallback: true });
+  let pdf;
+  let storageError = null;
+
+  try {
+    pdf = await downloadTextbookPdfFromStorage(textbookId, part, onProgress);
+  } catch (error) {
+    storageError = error;
+    console.warn('Firebase Storage textbook lookup failed; trying legacy external source.', error);
+  }
+
+  if (!pdf) {
+    onProgress?.('В Storage учебник не найден. Пробую резервный внешний источник…');
+    try {
+      pdf = await downloadTextbookPdf(user, textbookId, part, onProgress);
+    } catch (fallbackError) {
+      const storageMessage = storageError?.message ? `Firebase Storage: ${storageError.message}` : '';
+      const fallbackMessage = fallbackError?.message ? `Резервный источник: ${fallbackError.message}` : '';
+      throw new Error([storageMessage, fallbackMessage].filter(Boolean).join(' '));
+    }
+  }
+
+  const sourceKey = String(pdf.storagePath || pdf.sourceUrl || pdf.sourceName || '');
+  const savedCalibration = await loadUserPageCalibration(db, user.uid, textbookId, part, sourceKey);
+  let extracted;
+  try {
+    extracted = await extractRequestedPagesFromPdf(pdf.buffer, missing, {
+      onProgress,
+      user,
+      ocrFallback: true,
+      calibration: savedCalibration,
+    });
+  } catch (error) {
+    if (error?.code === 'PAGE_CALIBRATION_REQUIRED') {
+      error.calibration = {
+        ...(error.calibration || {}),
+        origin: 'automatic',
+        textbookId,
+        part: String(part || '1'),
+        sourceKey,
+        sourceName: pdf.sourceName || 'PDF учебника',
+      };
+    }
+    throw error;
+  }
+
+  if (!savedCalibration && extracted.calibration) {
+    await saveTextbookPageCalibration({
+      db,
+      user,
+      textbookId,
+      part,
+      pdfPage: extracted.calibration.pdfPage,
+      printedPage: extracted.calibration.printedPage,
+      sourceKey,
+      sourceName: pdf.sourceName || '',
+      mode: extracted.calibration.mode || 'auto',
+    }).catch((error) => console.warn('Не удалось сохранить автоматически найденную привязку страниц', error));
+  }
+
   const enriched = extracted.pages.map((item) => ({
     ...item,
     sourceName: pdf.sourceName,
@@ -433,13 +715,15 @@ export async function obtainTextbookPagesAutomatically({
 
   await Promise.all(enriched.map((item) => saveUserCachedPage(db, user.uid, textbookId, part, item)));
   const all = [...(cached.details || []), ...enriched];
-  const result = buildContext(all, requestedPages, 'automatic');
+  const result = buildContext(all, requestedPages, pdf.sourceType === 'firebase-storage' ? 'firebase-storage' : 'automatic');
   return {
     ...result,
     sourceName: pdf.sourceName,
     sourceUrl: pdf.sourceUrl,
     sourceType: pdf.sourceType,
+    storagePath: pdf.storagePath || '',
     offset: extracted.offset,
+    calibration: extracted.calibration || savedCalibration || null,
   };
 }
 
@@ -461,7 +745,44 @@ export async function obtainTextbookPagesFromUploadedPdf({
 
   onProgress?.(`Открываю ${file.name}…`);
   const buffer = await file.arrayBuffer();
-  const extracted = await extractRequestedPagesFromPdf(buffer, requestedPages, { onProgress, user, ocrFallback: true });
+  const sourceKey = `uploaded:${file.name || 'textbook.pdf'}:${file.size || 0}`;
+  const savedCalibration = await loadUserPageCalibration(db, user.uid, textbookId, part, sourceKey);
+  let extracted;
+  try {
+    extracted = await extractRequestedPagesFromPdf(buffer, requestedPages, {
+      onProgress,
+      user,
+      ocrFallback: true,
+      calibration: savedCalibration,
+    });
+  } catch (error) {
+    if (error?.code === 'PAGE_CALIBRATION_REQUIRED') {
+      error.calibration = {
+        ...(error.calibration || {}),
+        origin: 'uploaded-pdf',
+        textbookId,
+        part: String(part || '1'),
+        sourceKey,
+        sourceName: file.name || 'Загруженный PDF учебника',
+      };
+    }
+    throw error;
+  }
+
+  if (!savedCalibration && extracted.calibration) {
+    await saveTextbookPageCalibration({
+      db,
+      user,
+      textbookId,
+      part,
+      pdfPage: extracted.calibration.pdfPage,
+      printedPage: extracted.calibration.printedPage,
+      sourceKey,
+      sourceName: file.name || '',
+      mode: extracted.calibration.mode || 'auto',
+    }).catch((error) => console.warn('Не удалось сохранить привязку загруженного PDF', error));
+  }
+
   const enriched = extracted.pages.map((item) => ({
     ...item,
     sourceName: file.name || 'Загруженный PDF учебника',
@@ -476,6 +797,7 @@ export async function obtainTextbookPagesFromUploadedPdf({
     sourceName: file.name || 'Загруженный PDF учебника',
     sourceType: 'uploaded-pdf',
     offset: extracted.offset,
+    calibration: extracted.calibration || savedCalibration || null,
   };
 }
 

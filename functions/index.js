@@ -7,7 +7,7 @@ initializeApp();
 const db = getFirestore();
 const DASHSCOPE_API_KEY = defineSecret('DASHSCOPE_API_KEY');
 const PRIMARY_MODEL = 'qwen3.8-27b';
-const ALIBABA_BASE_URL = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
+const ALIBABA_NATIVE_ENDPOINT = 'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation';
 const FULL_DAILY_LIMIT = 5;
 const REFINE_DAILY_LIMIT = 30;
 
@@ -136,26 +136,43 @@ function extractJsonObject(text) {
   throw new Error('JSON Qwen оборвался.');
 }
 
+function nativeMessage(message) {
+  const content = Array.isArray(message?.content)
+    ? message.content.map((item) => item?.image ? { image: item.image } : { text: String(item?.text ?? item ?? '') })
+    : [{ text: String(message?.content ?? '') }];
+  return { role: message?.role || 'user', content };
+}
+
+function nativeContent(data) {
+  const content = data?.output?.choices?.[0]?.message?.content ?? data?.output?.text ?? '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map((x) => typeof x === 'string' ? x : (x?.text || '')).filter(Boolean).join('\n');
+  return String(content || '');
+}
+
 async function alibabaCompletion(messages) {
-  const res = await fetch(`${ALIBABA_BASE_URL}/chat/completions`, {
+  const res = await fetch(ALIBABA_NATIVE_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${DASHSCOPE_API_KEY.value()}` },
     body: JSON.stringify({
       model: PRIMARY_MODEL,
-      messages,
-      enable_thinking: false,
-      temperature: 0.2,
-      max_tokens: 8000,
+      input: { messages: messages.map(nativeMessage) },
+      parameters: {
+        result_format: 'message',
+        enable_thinking: false,
+        temperature: 0.2,
+        max_tokens: 8000,
+      },
     }),
   });
-  if (!res.ok) {
-    const errorText = await res.text();
-    console.error('Alibaba Model Studio failed', `${res.status}: ${errorText}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.code) {
+    console.error('Alibaba Model Studio failed', JSON.stringify(data));
     if (res.status === 401 || res.status === 403) throw new HttpsError('internal', 'Alibaba API key отклонён. Проверьте DASHSCOPE_API_KEY и регион ключа.');
     if (res.status === 429) throw new HttpsError('resource-exhausted', 'Alibaba Model Studio временно ограничил частоту запросов. Попробуйте ещё раз через минуту.');
-    throw new HttpsError('internal', 'Alibaba Qwen не смог сгенерировать ответ. Попробуйте ещё раз.');
+    throw new HttpsError('internal', data?.message || 'Alibaba Qwen не смог сгенерировать ответ. Попробуйте ещё раз.');
   }
-  return res.json();
+  return { ...data, _content: nativeContent(data) };
 }
 
 async function alibabaJson({ messages, schema }) {
@@ -165,7 +182,7 @@ async function alibabaJson({ messages, schema }) {
     : m);
 
   let response = await alibabaCompletion(prepared);
-  let raw = response.choices?.[0]?.message?.content || '';
+  let raw = response._content || '';
   try {
     return JSON.parse(extractJsonObject(raw));
   } catch {
@@ -173,7 +190,7 @@ async function alibabaJson({ messages, schema }) {
       ? { ...m, content: `${m.content}\nПредыдущая попытка была невалидным JSON. Сгенерируй ответ заново целиком, короче, и обязательно закрой все массивы и объекты.` }
       : m);
     response = await alibabaCompletion(retry);
-    raw = response.choices?.[0]?.message?.content || '';
+    raw = response._content || '';
     try { return JSON.parse(extractJsonObject(raw)); }
     catch { throw new HttpsError('internal', 'Qwen дважды вернул некорректный JSON. Попробуйте повторить генерацию.'); }
   }

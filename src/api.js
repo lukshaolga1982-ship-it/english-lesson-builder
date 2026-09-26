@@ -35,6 +35,10 @@ async function apiRequest(path, user, body) {
     if (error.name === 'AbortError') {
       throw new Error('Генерация заняла слишком много времени. Попробуйте ещё раз.');
     }
+    if (error instanceof TypeError && /failed to fetch/i.test(error.message || '')) {
+      const origin = typeof window !== 'undefined' ? window.location.origin : 'неизвестный origin';
+      throw new Error(`Сайт не смог связаться с Cloudflare Worker (origin: ${origin}). Обновите Worker до v13 и проверьте /health.`);
+    }
     throw error;
   } finally {
     clearTimeout(timeout);
