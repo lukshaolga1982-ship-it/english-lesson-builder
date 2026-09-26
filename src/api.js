@@ -223,76 +223,89 @@ function variantContract() {
   };
 }
 
+function compactLessonParams(payload = {}) {
+  const keys = [
+    'grade','level','textbookLabel','part','pages','unit','lesson','topic','duration','lessonType',
+    'studentCount','communication','leadingActivity','speechActivities','languageMaterial',
+    'competencies','literacies','extras','differentiation','listening','physicalBreakMode',
+    'previousHomework','homeworkMode','homework','classNotes','enabledStages','detail'
+  ];
+  return keys.reduce((out, key) => {
+    const value = payload[key];
+    if (value !== undefined && value !== null && value !== '' && !(Array.isArray(value) && value.length === 0)) out[key] = value;
+    return out;
+  }, {});
+}
+
+function compactTextbookContext(text = '', maxChars = 14000) {
+  const normalized = String(text || '')
+    .replace(/\r/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (normalized.length <= maxChars) return { text: normalized, trimmed: false };
+  const head = Math.floor(maxChars * 0.82);
+  const tail = maxChars - head;
+  return {
+    text: `${normalized.slice(0, head)}\n\n[...часть текста сокращена из-за лимита API; не придумывай пропущенное...]\n\n${normalized.slice(-tail)}`,
+    trimmed: true,
+  };
+}
+
+function compactSourceInfo(info = {}, trimmed = false) {
+  return {
+    source: info.source || '',
+    sourceName: info.sourceName || '',
+    requestedPages: info.requestedPages || [],
+    loadedPages: info.loadedPages || [],
+    missingPages: info.missingPages || [],
+    contextTrimmed: trimmed,
+  };
+}
+
+const OUTPUT_SCHEMA = `{
+"title":"", "meta":{"goal":"","successCriteria":[],"tasks":{"educational":[],"developmental":[],"upbringing":[]},"equipment":[],"forms":[],"methods":[],"plannedResults":[],"languageMaterial":[]},
+"lessonLogic":"", "sourceGrounding":{"textbookUsed":true,"pages":[],"references":[],"summary":""},
+"stages":[{"id":"","name":"","duration":0,"purpose":"","stageResult":"","teacher":"","students":"","activities":"","forms":[],"competencies":[],"literacy":[],"assessment":"","materials":"","answers":"","bridgeToNext":""}],
+"creativeOptions":{"opening":[],"movement":[],"reflection":[]},
+"methodicalCheck":{"summary":"","strengths":[],"warnings":[],"timeTotal":0},
+"homework":"", "listening":{"included":false,"script":"","tasks":[],"answers":[]}, "answerKeys":[], "appendices":{"worksheet":"","cards":""}, "teacherNotes":[]
+}`;
+
+const VARIANT_FIELDS = 'Каждый объект creativeOptions: {id,title,technique,duration,rationale,teacher,students,activities,forms,assessment,materials,stageResult,bridgeToNext}.';
+
 export async function generateLesson(user, payload) {
-  const methodology = buildMethodologyContext(payload);
-  const contract = lessonJsonContract();
-  const { textbookContext = '', textbookSourceInfo = {}, ...lessonParams } = payload;
-  contract.creativeOptions.opening = [variantContract(), variantContract(), variantContract()];
-  contract.creativeOptions.movement = payload.physicalBreakMode === 'Не добавлять'
-    ? []
-    : [variantContract(), variantContract(), variantContract()];
-  contract.creativeOptions.reflection = [variantContract(), variantContract(), variantContract()];
+  const methodology = buildMethodologyContext(payload, { compact: true });
+  const params = compactLessonParams(payload);
+  const compactBook = compactTextbookContext(payload.textbookContext || '');
+  const source = compactSourceInfo(payload.textbookSourceInfo || {}, compactBook.trimmed);
+  const movementCount = payload.physicalBreakMode === 'Не добавлять' ? 0 : 3;
 
-  const prompt = `
-Сформируй полный методически грамотный план-конспект урока английского языка.
+  const prompt = `Создай полный план-конспект урока английского языка для школы Республики Беларусь. Верни только JSON.
 
-ПАРАМЕТРЫ УРОКА:
-${JSON.stringify(lessonParams, null, 2)}
+ПАРАМЕТРЫ:${JSON.stringify(params)}
 
-ТЕКСТ ВЫБРАННЫХ СТРАНИЦ УЧЕБНИКА — ОСНОВНОЙ ИСТОЧНИК СОДЕРЖАНИЯ:
-${textbookContext || '[Текст страниц не передан]'}
+ТЕКСТ УЧЕБНИКА (главный источник):\n${compactBook.text || '[не передан]'}
 
-ИНФОРМАЦИЯ ОБ ИСТОЧНИКЕ:
-${JSON.stringify(textbookSourceInfo, null, 2)}
+ИСТОЧНИК:${JSON.stringify(source)}
 
-ПРАВИЛА ОПОРЫ НА УЧЕБНИК:
-1. Если текст страниц передан, сначала проанализируй ЕГО, а уже потом проектируй урок.
-2. Используй содержание, тексты, диалоги, лексику, грамматические явления, формулировки заданий и упражнения с этих страниц как основу урока.
-3. Не заменяй материал учебника на полностью авторский набор заданий. Авторские задания можно добавлять только как логичное развитие материала учебника.
-4. Если в тексте явно видны номера упражнений, заголовки, вопросы или речевые образцы — ссылайся на них точно. Не придумывай номера упражнений, которых нет в источнике.
-5. Если на страницах есть текст для чтения/диалог/таблица/иллюстративная подпись, используй извлечённую из них информацию на последующих этапах и в речевой кульминации.
-6. Если выбранная учителем тема расходится с фактическим содержанием страниц, не игнорируй расхождение: укажи его в methodicalCheck.warnings и построй план вокруг реально переданного содержания настолько, насколько это возможно.
-7. sourceGrounding.textbookUsed = true только при наличии фактического текста страниц. В references перечисли 3–8 конкретных опор из источника.
+МЕТОДИКА:${JSON.stringify(methodology)}
 
-МЕТОДИЧЕСКОЕ ЯДРО (обязательные правила генерации):
-${JSON.stringify(methodology, null, 2)}
+ОБЯЗАТЕЛЬНО:
+- Если текст учебника есть, реально используй его тексты, лексику, грамматику и видимые упражнения; не выдумывай номера/содержание отсутствующих заданий. Авторские задания только развивают материал учебника.
+- Каждый этап имеет конкретный stageResult. Его результат используется дальше.
+- Между каждой парой соседних этапов bridgeToNext = результат текущего этапа → вопрос/дефицит → необходимость следующего действия; никаких пустых «переходим дальше».
+- Целевая лексика/грамматика проходит от тренировки к речевой задаче. Информация чтения/аудирования используется далее в говорении/письме, если это соответствует цели.
+- Рефлексия проверяет цель и successCriteria.
+- Сумма duration всех stages строго = ${Number(payload.duration)} минут.
+- Используй только enabledStages и сохраняй их логичный порядок.
+- Для проверяемых заданий дай ключ/образец.
+- creativeOptions.opening: ровно 3 разных lead-in; movement: ровно ${movementCount}; reflection: ровно 3. Варианты короткие, тематические, возрастно уместные и не считаются во время основного урока. ${VARIANT_FIELDS}
+- Если contextTrimmed=true, добавь предупреждение в methodicalCheck.warnings и не придумывай пропущенный фрагмент.
+- sourceGrounding.textbookUsed=true только если фактический текст выше не пустой; references = 3–8 конкретных опор, реально видимых в тексте.
+- Пиши достаточно подробно для работы учителя, но без повторов и методических пояснений ради объёма.
 
-КРИТИЧЕСКИ ВАЖНО ПРО ЛОГИКУ УРОКА:
-1. Не составляй набор независимых активностей. Урок должен разворачиваться как одна последовательность.
-2. Каждый stageResult должен реально использоваться далее: как языковая опора, содержательная информация, вопрос, решение или материал для следующего задания.
-3. Между КАЖДЫМИ двумя соседними этапами создай bridgeToNext. Запрещены пустые связки типа «Now let's do the next task» без содержательной причины.
-4. Хороший мостик: «что мы только что выяснили/сделали → какой вопрос или дефицит появился → зачем нужно следующее действие».
-5. Новая лексика/грамматика не должна исчезать после тренировки — она должна понадобиться в последующей речевой задаче.
-6. Если есть чтение/аудирование, информация из текста должна использоваться в последующем говорении/письме, если это соответствует цели.
-7. Рефлексия возвращается к цели и successCriteria урока; минимум два варианта рефлексии должны проверять учебный прогресс, а не только настроение.
-
-КРЕАТИВНЫЕ ВАРИАНТЫ:
-- creativeOptions.opening: ровно 3 действительно разных начала урока; каждое является lead-in и логически запускает основной урок. Не делай три косметических варианта одного приёма.
-- creativeOptions.movement: ровно 3 коротких варианта 1–3 минуты, если пауза разрешена. Должно быть реальное движение + простой тематический язык. Для 9–11 классов избегай детских «потянулись-зайчики».
-- creativeOptions.reflection: ровно 3 разных способа; связывай с successCriteria и конкретным результатом урока.
-- Используй загруженный банк приёмов как источник идей, но адаптируй каждый приём под тему, возраст и конкретную цель.
-
-ПОСЛЕДОВАТЕЛЬНОСТЬ УПРАЖНЕНИЙ:
-- соблюдай методическую динамику и нужный путь для выбранного ведущего вида речевой деятельности;
-- не перепрыгивай от предъявления прямо к сложной свободной речи, если учащимся нужны опоры/тренировка;
-- одновременно не перегружай урок лишними промежуточными упражнениями;
-- кульминация урока — осмысленная речевая/коммуникативная задача, соответствующая ведущей деятельности.
-
-ФИНАЛЬНАЯ САМОПРОВЕРКА ПЕРЕД ОТВЕТОМ:
-- все этапы нужны для цели;
-- каждый переход содержательно объясним;
-- stageResult каждого этапа конкретен;
-- мостики ссылаются на фактическое содержание соседних заданий;
-- сумма duration строго равна ${Number(payload.duration)};
-- задания реалистичны для ${payload.grade} класса и уровня «${payload.level}»;
-- выбранные компетенции/грамотности проявляются в действиях учащихся;
-- если текст страниц передан, минимум половина содержательно значимых этапов реально использует материал этих страниц;
-- sourceGrounding подтверждает конкретно, что именно взято из учебника;
-- нет выдуманных утверждений о содержании страниц учебника, если сам текст страниц в запросе не передан.
-
-ВЕРНИ ТОЛЬКО ОДИН JSON-ОБЪЕКТ ТОЧНО ТАКОЙ СТРУКТУРЫ:
-${JSON.stringify(contract, null, 2)}
-`;
+СХЕМА ОТВЕТА:${OUTPUT_SCHEMA}`;
 
   const data = await apiRequest('/generate', user, { prompt });
   return {
@@ -304,38 +317,31 @@ ${JSON.stringify(contract, null, 2)}
 
 export async function refineLessonStage(user, { mode, stage, previousStage, nextStage, lessonContext, form, textbookContext = '' }) {
   const modeText = {
-    regenerate: 'Перегенерируй этот этап полностью, сохранив его место, функцию, длительность и связь с соседними этапами.',
-    interesting: 'Сделай этот этап заметно интереснее и активнее, но не превращай его в случайную игру и не ломай логику урока.',
-    simpler: 'Сделай этот этап проще и доступнее: снизь языковую/когнитивную нагрузку, добавь опоры, сохрани учебный результат.',
-    harder: 'Сделай этот этап сложнее и содержательнее: больше самостоятельности, выбора и аргументации, но реалистично для класса.',
-    bridge: 'Сохрани само задание, но перепиши stageResult и bridgeToNext так, чтобы переход к следующему этапу был содержательным и естественным.',
-  }[mode] || 'Улучши этот этап, сохранив его методическую функцию.';
+    regenerate: 'Перегенерируй этап полностью, сохрани функцию, длительность и место.',
+    interesting: 'Сделай этап интереснее и активнее без случайной игры.',
+    simpler: 'Сделай этап проще: снизь нагрузку и добавь опоры.',
+    harder: 'Сделай этап сложнее: больше самостоятельности, выбора и аргументации.',
+    bridge: 'Сохрани задание, но улучши stageResult и bridgeToNext.',
+  }[mode] || 'Улучши этап без изменения его функции.';
 
-  const methodology = buildMethodologyContext({ ...form, enabledStages: [stage?.name].filter(Boolean) });
-  const prompt = `${modeText}
-
-ОБЯЗАТЕЛЬНО: логический мостик строится как «результат текущего этапа → вопрос/дефицит → необходимость следующего действия». Не используй формальный переход без связи с содержанием.
-
-Верни JSON-объект ТОЛЬКО для одного этапа с полями: name, duration, purpose, stageResult, teacher, students, activities, forms, competencies, literacy, assessment, materials, answers, bridgeToNext.
-
-Контекст урока:
-${JSON.stringify({ lessonContext, form, methodology }, null, 2)}
-
-Фактический текст выбранных страниц учебника (если есть):
-${textbookContext || '[не передан]'}
-
-Если текст учебника передан, не отрывай улучшенный этап от него и не заменяй фактическое содержание выдуманным материалом.
-
-Предыдущий этап:
-${JSON.stringify(previousStage || null, null, 2)}
-
-Текущий этап:
-${JSON.stringify(stage, null, 2)}
-
-Следующий этап:
-${JSON.stringify(nextStage || null, null, 2)}
-
-Если следующего этапа нет, bridgeToNext должен быть пустой строкой.`;
+  const methodology = buildMethodologyContext({ ...form, enabledStages: [stage?.name].filter(Boolean) }, { compact: true });
+  const book = compactTextbookContext(textbookContext, 6500).text;
+  const compactContext = {
+    topic: lessonContext?.title || form?.topic || '',
+    goal: lessonContext?.meta?.goal || '',
+    successCriteria: lessonContext?.meta?.successCriteria || [],
+    grade: form?.grade,
+    level: form?.level,
+    leadingActivity: form?.leadingActivity,
+  };
+  const prompt = `${modeText} Верни только JSON одного этапа с полями name,duration,purpose,stageResult,teacher,students,activities,forms,competencies,literacy,assessment,materials,answers,bridgeToNext.
+Логический мостик: конкретный результат текущего этапа → вопрос/дефицит → следующее действие. Если следующего этапа нет, bridgeToNext="".
+КОНТЕКСТ:${JSON.stringify(compactContext)}
+МЕТОДИКА:${JSON.stringify(methodology)}
+УЧЕБНИК:${book || '[не передан]'}
+ПРЕДЫДУЩИЙ:${JSON.stringify(previousStage || null)}
+ТЕКУЩИЙ:${JSON.stringify(stage)}
+СЛЕДУЮЩИЙ:${JSON.stringify(nextStage || null)}`;
   const data = await apiRequest('/refine', user, { prompt });
   return {
     stage: normalizeStage(data.result?.stage || data.result),
@@ -343,3 +349,4 @@ ${JSON.stringify(nextStage || null, null, 2)}
     model: data.model,
   };
 }
+

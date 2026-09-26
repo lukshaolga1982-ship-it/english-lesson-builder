@@ -204,7 +204,8 @@ function unique(items) {
   return [...new Set(items.filter(Boolean))];
 }
 
-export function buildMethodologyContext(form = {}) {
+export function buildMethodologyContext(form = {}, options = {}) {
+  const compact = Boolean(options?.compact);
   const relevantPathways = unique([
     form.leadingActivity,
     ...(form.speechActivities || []),
@@ -218,6 +219,26 @@ export function buildMethodologyContext(form = {}) {
     name,
     ...(stageFunctions[name] || {}),
   }));
+
+  if (compact) {
+    return {
+      basis: programCoverage[Number(form.grade)] || 'Для этого класса отдельная программа в базе не загружена.',
+      logic: [
+        'Все этапы работают на диагностичную цель и общий речевой результат.',
+        'Результат каждого этапа используется далее; между соседними этапами обязателен bridgeToNext по формуле: результат → дефицит/вопрос → следующее действие.',
+        'Последовательность: осмысление/опора → управляемая тренировка → условно-речевое использование → самостоятельное коммуникативное применение, если этого требует цель.',
+        'Целевой языковой материал и содержание учебника проходят через урок, а не исчезают после отдельного упражнения.',
+        'Рефлексия сопоставляет цель и критерии успеха с фактическим результатом учащихся.',
+      ],
+      stages: selectedStages,
+      pathways: relevantPathways,
+      techniques: {
+        opening: creativeTechniqueBank.openings.map((x) => x.name),
+        movement: creativeTechniqueBank.movement.map((x) => x.name),
+        reflection: creativeTechniqueBank.reflections.map((x) => x.name),
+      },
+    };
+  }
 
   return {
     version: METHODOLOGY_VERSION,

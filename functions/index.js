@@ -5,9 +5,9 @@ import { HttpsError, onCall } from 'firebase-functions/v2/https';
 
 initializeApp();
 const db = getFirestore();
-const GROQ_API_KEY = defineSecret('GROQ_API_KEY');
-const PRIMARY_MODEL = 'qwen/qwen3.8-27b';
-const FALLBACK_MODEL = 'openai/gpt-oss-120b';
+const DASHSCOPE_API_KEY = defineSecret('DASHSCOPE_API_KEY');
+const PRIMARY_MODEL = 'qwen3.8-27b';
+const ALIBABA_BASE_URL = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
 const FULL_DAILY_LIMIT = 5;
 const REFINE_DAILY_LIMIT = 30;
 
@@ -116,28 +116,33 @@ async function loadTextbookContext(textbookId, pagesString) {
   return chunks.join('\n\n').slice(0,70000);
 }
 
-async function groqJson({ messages, schema, schemaName }) {
-  const apiKey = GROQ_API_KEY.value();
-  const body = (model) => ({
-    model,
-    messages,
-    temperature: 0.45,
-    reasoning_effort: model.startsWith('qwen/') ? 'medium' : 'low',
-    response_format: { type: 'json_schema', json_schema: { name: schemaName, strict: true, schema } },
+async function alibabaJson({ messages, schema }) {
+  const apiKey = DASHSCOPE_API_KEY.value();
+  const schemaHint = schema ? `\nТребуемая структура JSON: ${JSON.stringify(schema)}` : '';
+  const prepared = messages.map((m, index) => index === messages.length - 1
+    ? { ...m, content: `${m.content}${schemaHint}\nВерни только валидный JSON.` }
+    : m);
+
+  const res = await fetch(`${ALIBABA_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: PRIMARY_MODEL,
+      messages: prepared,
+      enable_thinking: false,
+      max_tokens: 8000,
+      response_format: { type: 'json_object' },
+    }),
   });
-  let lastError = '';
-  for (const model of [PRIMARY_MODEL, FALLBACK_MODEL]) {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body(model)),
-    });
-    if (res.ok) {
-      const json = await res.json();
-      return JSON.parse(json.choices?.[0]?.message?.content || '{}');
-    }
-    lastError = `${res.status}: ${await res.text()}`;
+  if (res.ok) {
+    const json = await res.json();
+    return JSON.parse(json.choices?.[0]?.message?.content || '{}');
   }
-  console.error('Groq failed', lastError);
-  throw new HttpsError('internal', 'Groq не смог сгенерировать ответ. Попробуйте ещё раз.');
+  const errorText = await res.text();
+  console.error('Alibaba Model Studio failed', `${res.status}: ${errorText}`);
+  if (res.status === 401 || res.status === 403) throw new HttpsError('internal', 'Alibaba API key отклонён. Проверьте DASHSCOPE_API_KEY и регион ключа.');
+  if (res.status === 429) throw new HttpsError('resource-exhausted', 'Alibaba Model Studio временно ограничил частоту запросов. Попробуйте ещё раз через минуту.');
+  throw new HttpsError('internal', 'Alibaba Qwen не смог сгенерировать ответ. Попробуйте ещё раз.');
 }
 
 function systemPrompt() {
@@ -155,10 +160,10 @@ function systemPrompt() {
 10. Если дан текст страниц учебника, используй его как основной источник содержания и не придумывай упражнения учебника, которых там нет. Можно добавлять авторские задания, явно интегрируя их в урок.\n
 11. Не перегружай урок количеством активностей. Реалистично оцени время.\n
 12. Если ведущая деятельность — диалогическая/монологическая речь, аудирование, чтение или письменная речь, она должна определять кульминационную коммуникативную задачу урока.\n
-13. Формат вывода строго соответствует JSON schema.`;
+13. Формат вывода — только валидный JSON, строго по переданной структуре.`;
 }
 
-export const generateLesson = onCall({ region: 'europe-west1', secrets: [GROQ_API_KEY], timeoutSeconds: 120, memory: '512MiB' }, async (request) => {
+export const generateLesson = onCall({ region: 'europe-west1', secrets: [DASHSCOPE_API_KEY], timeoutSeconds: 120, memory: '512MiB' }, async (request) => {
   if (!request.auth?.uid) throw new HttpsError('unauthenticated', 'Нужно войти через Google.');
   const data = request.data || {};
   if (!data.topic || !data.grade || !data.lessonType) throw new HttpsError('invalid-argument', 'Не заполнены обязательные поля.');
@@ -175,11 +180,11 @@ export const generateLesson = onCall({ region: 'europe-west1', secrets: [GROQ_AP
     detail: data.detail, format: data.format,
   }, null, 2)}\n\nТЕКСТ ВЫБРАННЫХ СТРАНИЦ УЧЕБНИКА:\n${textbookContext || '[Страницы ещё не загружены в библиотеку Smart Lesson. Не утверждай, что видел их содержание.]'}\n\nНазвание урока должно быть: «${data.topic}. ${data.leadingActivity}».`;
 
-  const lesson = await groqJson({ messages: [{ role:'system', content:systemPrompt() }, { role:'user', content:userPrompt }], schema:lessonSchema, schemaName:'lesson_plan' });
+  const lesson = await alibabaJson({ messages: [{ role:'system', content:systemPrompt() }, { role:'user', content:userPrompt }], schema:lessonSchema, schemaName:'lesson_plan' });
   return { lesson, remaining };
 });
 
-export const refineLesson = onCall({ region: 'europe-west1', secrets: [GROQ_API_KEY], timeoutSeconds: 120, memory: '256MiB' }, async (request) => {
+export const refineLesson = onCall({ region: 'europe-west1', secrets: [DASHSCOPE_API_KEY], timeoutSeconds: 120, memory: '256MiB' }, async (request) => {
   if (!request.auth?.uid) throw new HttpsError('unauthenticated', 'Нужно войти через Google.');
   await consume(request.auth.uid, 'refinements', REFINE_DAILY_LIMIT);
   const { mode, stage, lessonContext, form } = request.data || {};
@@ -191,7 +196,7 @@ export const refineLesson = onCall({ region: 'europe-west1', secrets: [GROQ_API_
     harder: 'Усложни этап для сильных учащихся: добавь выбор, аргументацию, более самостоятельное использование языка, сохрани время.',
   };
   const prompt = `${instructions[mode] || instructions.regenerate}\nКонтекст урока: ${JSON.stringify(lessonContext)}\nПараметры: ${JSON.stringify({grade:form?.grade,level:form?.level,topic:form?.topic,studentCount:form?.studentCount,classNotes:form?.classNotes,competencies:form?.competencies,literacies:form?.literacies})}\nИсходный этап: ${JSON.stringify(stage)}\nВерни один этап. duration и name не меняй без крайней необходимости.`;
-  const stageOut = await groqJson({ messages:[{role:'system',content:systemPrompt()},{role:'user',content:prompt}], schema:stageSchema, schemaName:'lesson_stage' });
+  const stageOut = await alibabaJson({ messages:[{role:'system',content:systemPrompt()},{role:'user',content:prompt}], schema:stageSchema, schemaName:'lesson_stage' });
   stageOut.name = stage.name; stageOut.duration = stage.duration; stageOut.id = stage.id;
   return { stage: stageOut };
 });

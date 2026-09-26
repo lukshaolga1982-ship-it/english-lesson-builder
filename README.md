@@ -2,6 +2,19 @@
 
 Конструктор методически связанных планов-конспектов уроков английского языка для учителей Республики Беларусь.
 
+## Версия 0.9 — Alibaba Cloud Model Studio / Qwen
+
+Текущий AI-провайдер — **Alibaba Cloud Model Studio**, модель **`qwen3.8-27b`**. Она используется и для генерации уроков, и для распознавания фотографий страниц учебника. Worker работает через OpenAI-compatible интерфейс Alibaba, но запросы отправляются не в OpenAI, а в Alibaba Model Studio.
+
+Нужный Cloudflare Secret:
+
+```text
+DASHSCOPE_API_KEY
+```
+
+По умолчанию используется международный Singapore endpoint `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. При необходимости можно задать `ALIBABA_BASE_URL` отдельно. Подробная настройка: [`ALIBABA-SETUP.md`](./ALIBABA-SETUP.md).
+
+
 ## Версия 0.5 — автоматическая работа со страницами учебника
 
 Теперь **не нужно заранее скачивать все учебники и вручную загружать страницы в Firestore**.
@@ -21,7 +34,7 @@ PDF.js извлекает текст только нужных страниц
         ↓
 Текст сохраняется в users/{uid}/textbookCache
         ↓
-Реальный текст страниц передаётся Groq
+Реальный текст страниц передаётся Alibaba Qwen
         ↓
 План строится с опорой на упражнения, тексты, лексику и грамматику выбранного разворота
 ```
@@ -63,7 +76,7 @@ Worker сначала пытается определить электронну
 ```text
 src/
   App.jsx              интерфейс, получение страниц, генерация
-  api.js               запрос к Groq и нормализация ответа
+  api.js               запрос к API и нормализация ответа
   textbookSource.js    кэш, получение PDF и извлечение выбранных страниц
   methodology.js       методическое ядро и банк приёмов
   textbooks.js         каталог учебников, типы и этапы уроков
@@ -71,7 +84,7 @@ src/
   firebase.js          Firebase web config
   styles.css           стили
 
-cloudflare-worker.js   Worker: Firebase Auth, Groq, поиск/прокси PDF
+cloudflare-worker.js   Worker: Firebase Auth, Alibaba Qwen, поиск/прокси PDF
 firestore.rules        правила Firestore, включая личный textbookCache
 ```
 
@@ -128,7 +141,7 @@ firebase deploy --only firestore:rules
 
 Bindings остаются прежними:
 
-- Secret `GROQ_API_KEY`;
+- Secret `DASHSCOPE_API_KEY`;
 - KV binding `USAGE_LIMITS`.
 
 Новый binding для учебников не требуется. `USAGE_LIMITS` также используется для кратковременного кэша найденных URL электронных версий.
@@ -212,17 +225,33 @@ npm run build
 На шаге «Основа урока» теперь доступны три способа передать содержание учебника:
 
 1. автоматическое получение электронной версии;
-2. загрузка фото страниц (JPG/PNG/WEBP) с OCR через Groq vision;
+2. загрузка фото страниц (JPG/PNG/WEBP) с OCR через Alibaba Qwen vision;
 3. загрузка PDF учебника с компьютера — браузер извлекает только указанные печатные страницы.
 
 PDF-файл целиком в Firestore не сохраняется. В личном `users/{uid}/textbookCache` сохраняется только извлечённый текст нужных страниц. Фото также не сохраняются в Firestore: после OCR сохраняется только распознанный текст, если удалось однозначно сопоставить одно фото одной странице.
 
-Для OCR необходимо обновить Cloudflare Worker из этого же репозитория: появился endpoint `/ocr-textbook-images`. Секрет `GROQ_API_KEY` остаётся прежним.
+Для OCR необходимо обновить Cloudflare Worker из этого же репозитория: появился endpoint `/ocr-textbook-images`. Нужен секрет `DASHSCOPE_API_KEY`.
 
-## v0.7 — защита от лимита Groq TPM
+## v0.7 — прежняя версия с Groq
 
 - Генератор отправляет компактный методический контекст вместо полного банка правил и повторяющихся JSON-схем.
 - Текст учебника остаётся главным источником, но слишком большой контекст аккуратно ограничивается; генератор получает явное предупреждение не придумывать пропущенное.
-- Для Qwen включён instruct/non-reasoning режим; запрос идёт через `service_tier: auto`.
-- Устаревший vision fallback Llama 4 удалён; OCR использует актуальный `qwen/qwen3.8-27b`.
+- В v0.8 провайдер генерации и OCR заменён на Alibaba Qwen.
+- OCR фото страниц и основная генерация теперь используют `qwen3.8-27b`.
 - Если лимит всё же достигнут после OCR, интерфейс показывает понятное сообщение вместо сырой ошибки API.
+
+
+## v0.9 — Alibaba Cloud Model Studio / Qwen
+
+Основная генерация планов и OCR изображений страниц работают через Alibaba Cloud Model Studio, модель `qwen3.8-27b`.
+
+Cloudflare Worker ожидает секрет `DASHSCOPE_API_KEY`. Старый `GROQ_API_KEY` после проверки новой версии больше не нужен.
+
+### Как добавить ключ в Cloudflare
+1. Создайте API key в Alibaba Cloud Model Studio (рекомендуемый регион: Singapore).
+2. Cloudflare → Workers & Pages → ваш Worker → Settings → Variables and Secrets.
+3. Добавьте Secret с именем `DASHSCOPE_API_KEY`.
+4. Значение — созданный Model Studio API key.
+5. Сохраните и задеплойте обновлённый `cloudflare-worker.js`.
+
+Alibaba Model Studio тарифицируется отдельно. Для API используется собственная квота/биллинг Alibaba Cloud.

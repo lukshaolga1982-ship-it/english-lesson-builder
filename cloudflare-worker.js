@@ -1,7 +1,8 @@
 const FIREBASE_PROJECT_ID = "english-lesson-builder";
-const PRIMARY_MODEL = "qwen/qwen3.8-27b";
-const FALLBACK_MODEL = "openai/gpt-oss-120b";
-const VISION_FALLBACK_MODEL = null;
+const PRIMARY_MODEL = "qwen3.8-27b";
+const FALLBACK_MODEL = null;
+const VISION_MODEL = "qwen3.8-27b";
+const DEFAULT_ALIBABA_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 
 const ALLOWED_ORIGINS = new Set([
   "https://lukshaolga1982-ship-it.github.io",
@@ -455,45 +456,74 @@ function safeJsonParse(text) {
   try { return JSON.parse(text); } catch { return text; }
 }
 
-async function callGroq(env, prompt, systemPrompt) {
-  const models = [PRIMARY_MODEL, FALLBACK_MODEL].filter(Boolean);
-  let lastError = null;
-  for (const model of models) {
-    try {
-      const body = {
-        model,
-        messages: [{ role: "system", content: systemPrompt }, { role: "user", content: prompt }],
-        temperature: 0.35,
-        max_completion_tokens: 5200,
-        response_format: { type: "json_object" },
-        service_tier: "auto",
-      };
-      if (model.startsWith("qwen/")) body.reasoning_effort = "none";
-
-      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${env.GROQ_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        const message = data?.error?.message || `Groq вернул HTTP ${response.status} для ${model}`;
-        lastError = new Error(message);
-        lastError.status = response.status;
-        lastError.code = data?.error?.code || '';
-        continue;
-      }
-      const content = data?.choices?.[0]?.message?.content;
-      if (!content) { lastError = new Error(`Groq не вернул текст ответа для ${model}.`); continue; }
-      return { model, result: safeJsonParse(content), usage: data.usage || null };
-    } catch (error) { lastError = error; }
-  }
-  throw lastError || new Error("Не удалось получить ответ от Groq.");
+function alibabaBaseUrl(env) {
+  return String(env.ALIBABA_BASE_URL || DEFAULT_ALIBABA_BASE_URL).replace(/\/+$/, "");
 }
 
+function alibabaApiKey(env) {
+  return env.DASHSCOPE_API_KEY || env.ALIBABA_API_KEY || "";
+}
 
-async function callGroqVisionOcr(env, images) {
-  const models = [PRIMARY_MODEL].filter(Boolean);
+function alibabaErrorMessage(data, status, model) {
+  const raw = data?.error?.message || data?.message || `Alibaba Model Studio вернул HTTP ${status} для ${model}`;
+  if (status === 401 || status === 403) {
+    return `Alibaba Model Studio отклонил API key. Проверьте DASHSCOPE_API_KEY и регион ключа/ALIBABA_BASE_URL. ${raw}`;
+  }
+  if (status === 429) {
+    return `Alibaba Model Studio временно ограничил частоту запросов. Попробуйте ещё раз через минуту. ${raw}`;
+  }
+  return raw;
+}
+
+async function callAlibaba(env, prompt, systemPrompt) {
+  const models = [String(env.QWEN_MODEL || PRIMARY_MODEL), FALLBACK_MODEL].filter(Boolean);
+  const apiKey = alibabaApiKey(env);
+  const baseUrl = alibabaBaseUrl(env);
+  let lastError = null;
+
+  for (const model of models) {
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: prompt },
+          ],
+          enable_thinking: false,
+          max_tokens: 8000,
+          response_format: { type: "json_object" },
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = alibabaErrorMessage(data, response.status, model);
+        lastError = new Error(message);
+        lastError.status = response.status;
+        lastError.code = data?.error?.code || data?.code || data?.error?.type || "";
+        continue;
+      }
+
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) {
+        lastError = new Error(`Alibaba Model Studio не вернул текст ответа для ${model}.`);
+        continue;
+      }
+      return { model, result: safeJsonParse(content), usage: data.usage || null };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Не удалось получить ответ от Alibaba Model Studio.");
+}
+
+async function callAlibabaVisionOcr(env, images) {
   const content = [{
     type: "text",
     text: `Ты выполняешь точное распознавание страниц школьного учебника английского языка.
@@ -510,35 +540,38 @@ async function callGroqVisionOcr(env, images) {
 
   for (const image of images) {
     content.push({ type: "text", text: `Метка следующего изображения: ${String(image.label || "страница").slice(0, 120)}` });
-    content.push({ type: "image_url", image_url: { url: image.dataUrl } });
+    content.push({
+      type: "image_url",
+      image_url: { url: image.dataUrl },
+    });
   }
 
-  let lastError = null;
-  for (const model of models) {
-    try {
-      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${env.GROQ_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content }],
-          temperature: 0.1,
-          max_completion_tokens: 5200,
-          service_tier: "auto",
-          reasoning_effort: "none",
-          response_format: { type: "json_object" },
-        }),
-      });
-      const data = await response.json();
-      if (!response.ok) { lastError = new Error(data?.error?.message || `Groq OCR вернул HTTP ${response.status} для ${model}`); continue; }
-      const raw = data?.choices?.[0]?.message?.content;
-      const parsed = safeJsonParse(raw || "");
-      const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
-      if (!pages.length) { lastError = new Error(`Модель ${model} не вернула распознанные страницы.`); continue; }
-      return { model, pages, usage: data.usage || null };
-    } catch (error) { lastError = error; }
+  const model = String(env.QWEN_VISION_MODEL || env.QWEN_MODEL || VISION_MODEL);
+  const response = await fetch(`${alibabaBaseUrl(env)}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${alibabaApiKey(env)}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content }],
+      enable_thinking: false,
+      max_tokens: 8000,
+      response_format: { type: "json_object" },
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(alibabaErrorMessage(data, response.status, model));
   }
-  throw lastError || new Error("Не удалось распознать изображения учебника.");
+
+  const raw = data?.choices?.[0]?.message?.content;
+  const parsed = safeJsonParse(raw || "");
+  const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
+  if (!pages.length) throw new Error("Alibaba Qwen не вернул распознанные страницы.");
+  return { model, pages, usage: data.usage || null };
 }
 
 async function handleOcrTextbookImages(request, env, user) {
@@ -563,7 +596,7 @@ async function handleOcrTextbookImages(request, env, user) {
   });
   if (totalChars > 18_000_000) return jsonResponse(request, { ok: false, error: "IMAGES_TOO_LARGE", message: "Изображения слишком большие. Попробуйте загрузить меньше страниц за один раз." }, 413);
 
-  const result = await callGroqVisionOcr(env, clean);
+  const result = await callAlibabaVisionOcr(env, clean);
   const next = await incrementUsage(env, user.sub, "ocr");
   return jsonResponse(request, { ok: true, ...result, limit: OCR_DAILY_LIMIT, used: next, remaining: Math.max(0, OCR_DAILY_LIMIT - next) });
 }
@@ -615,9 +648,9 @@ async function handleGenerate(request, env, user) {
   const body = await request.json();
   const prompt = normalizePrompt(body);
   if (prompt.length > 50000) return jsonResponse(request, { ok: false, error: "PROMPT_TOO_LARGE", message: "Материал запроса слишком большой." }, 413);
-  const groq = await callGroq(env, prompt, LESSON_SYSTEM_PROMPT);
+  const alibaba = await callAlibaba(env, prompt, LESSON_SYSTEM_PROMPT);
   const next = await incrementUsage(env, user.sub, "generate");
-  return jsonResponse(request, { ok: true, ...groq, limit: FULL_DAILY_LIMIT, used: next, remaining: Math.max(0, FULL_DAILY_LIMIT - next) });
+  return jsonResponse(request, { ok: true, ...alibaba, limit: FULL_DAILY_LIMIT, used: next, remaining: Math.max(0, FULL_DAILY_LIMIT - next) });
 }
 
 async function handleRefine(request, env, user) {
@@ -628,9 +661,9 @@ async function handleRefine(request, env, user) {
   }
   const body = await request.json();
   const prompt = normalizePrompt(body);
-  const groq = await callGroq(env, prompt, REFINE_SYSTEM_PROMPT);
+  const alibaba = await callAlibaba(env, prompt, REFINE_SYSTEM_PROMPT);
   const next = await incrementUsage(env, user.sub, "refine");
-  return jsonResponse(request, { ok: true, ...groq, limit: REFINE_DAILY_LIMIT, used: next, remaining: Math.max(0, REFINE_DAILY_LIMIT - next) });
+  return jsonResponse(request, { ok: true, ...alibaba, limit: REFINE_DAILY_LIMIT, used: next, remaining: Math.max(0, REFINE_DAILY_LIMIT - next) });
 }
 
 export default {
@@ -642,13 +675,13 @@ export default {
       return jsonResponse(request, {
         ok: true,
         service: "Smart Lesson API",
-        groqConfigured: Boolean(env.GROQ_API_KEY),
+        alibabaConfigured: Boolean(alibabaApiKey(env)),
+        alibabaBaseUrl: alibabaBaseUrl(env),
         kvConfigured: Boolean(env.USAGE_LIMITS),
         automaticTextbooks: Object.keys(TEXTBOOK_SOURCES),
         primaryModel: PRIMARY_MODEL,
         fallbackModel: FALLBACK_MODEL,
-        visionModel: PRIMARY_MODEL,
-        visionFallbackModel: VISION_FALLBACK_MODEL,
+        visionModel: VISION_MODEL,
         textbookImageOcr: true,
       });
     }
@@ -668,7 +701,7 @@ export default {
       if (url.pathname === "/textbook-source") return await handleTextbookSource(request, env, user);
       if (url.pathname === "/textbook-pdf") return await handleTextbookPdf(request, env, user);
 
-      if (!env.GROQ_API_KEY) return jsonResponse(request, { ok: false, error: "GROQ_NOT_CONFIGURED", message: "В Worker не найден секрет GROQ_API_KEY." }, 500);
+      if (!alibabaApiKey(env)) return jsonResponse(request, { ok: false, error: "ALIBABA_NOT_CONFIGURED", message: "В Worker не найден секрет DASHSCOPE_API_KEY." }, 500);
       if (url.pathname === "/ocr-textbook-images") return await handleOcrTextbookImages(request, env, user);
 
       if (url.pathname === "/generate") return await handleGenerate(request, env, user);

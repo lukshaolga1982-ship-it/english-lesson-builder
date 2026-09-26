@@ -345,6 +345,8 @@ export default function App() {
       if (e?.code === 'DAILY_LIMIT') {
         setRemaining(0);
         setNotice('Лимит: 5 полных генераций на сегодня уже использованы.');
+      } else if (/tokens per minute|\bTPM\b|Request too large for model/i.test(msg)) {
+        setNotice('Alibaba Qwen отклонил запрос из-за лимита или размера. Попробуйте ещё раз через минуту; если ошибка повторится, уменьшите количество страниц учебника в одной генерации.');
       } else {
         setNotice(`Ошибка генерации: ${msg}`);
       }
@@ -422,7 +424,7 @@ export default function App() {
     <main className="page">
       <section className="hero">
         <div><span className="eyebrow"><Sparkles size={14}/> Для учителей Республики Беларусь</span><h1>План-конспект урока<br/><em>с методической логикой</em></h1><p>Smart Lesson выстраивает задания в последовательность, связывает этапы логическими мостиками и предлагает несколько вариантов начала, двигательной паузы и рефлексии.</p></div>
-        <div className="hero-card"><Zap/><strong>Groq + Qwen</strong><span>5 полных генераций в сутки</span>{remaining !== null && <small>Сегодня осталось: {remaining}</small>}</div>
+        <div className="hero-card"><Zap/><strong>Alibaba · Qwen3.8-27B</strong><span>5 полных генераций в сутки</span>{remaining !== null && <small>Сегодня осталось: {remaining}</small>}</div>
       </section>
 
       <section className="builder">
