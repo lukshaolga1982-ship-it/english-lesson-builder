@@ -1,5 +1,5 @@
 import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore';
-import { getBytes, listAll, ref as storageRef } from 'firebase/storage';
+import { getDownloadURL, listAll, ref as storageRef } from 'firebase/storage';
 import { storage } from './firebase';
 import { storageTextbookFiles } from './textbooks';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -277,11 +277,11 @@ async function downloadTextbookPdfFromStorage(textbookId, part = '1', onProgress
   }
   if (!fileRef) throw new Error(`PDF выбранного учебника (часть ${part}) не найден в Firebase Storage.`);
 
-  onProgress?.(`Загружаю ${fileRef.name} из Firebase Storage…`);
+  onProgress?.(`Получаю ссылку на ${fileRef.name} из Firebase Storage…`);
   try {
-    const buffer = await getBytes(fileRef, 100 * 1024 * 1024);
+    const url = await getDownloadURL(fileRef);
     return {
-      buffer,
+      url,
       sourceName: fileRef.name,
       sourceType: 'firebase-storage',
       sourceUrl: `gs://${storage.app.options.storageBucket}/${fileRef.fullPath}`,
@@ -290,9 +290,9 @@ async function downloadTextbookPdfFromStorage(textbookId, part = '1', onProgress
   } catch (error) {
     const code = String(error?.code || '');
     if (code.includes('unauthorized')) {
-      throw new Error('Firebase Storage не разрешил скачать PDF. Проверьте Storage Rules для авторизованных пользователей.');
+      throw new Error('Firebase Storage не разрешил получить ссылку на PDF. Проверьте Storage Rules для авторизованных пользователей.');
     }
-    throw new Error(`Не удалось скачать PDF из Firebase Storage: ${error?.message || error}`);
+    throw new Error(`Не удалось получить ссылку на PDF из Firebase Storage: ${error?.message || error}`);
   }
 }
 
@@ -554,14 +554,34 @@ async function ocrDataUrl(user, dataUrl, label, onProgress) {
   return String(first?.text || '').trim();
 }
 
-async function extractRequestedPagesFromPdf(buffer, printedPages, {
+async function extractRequestedPagesFromPdf(source, printedPages, {
   onProgress,
   user = null,
   ocrFallback = false,
   calibration = null,
 } = {}) {
-  onProgress?.('Открываю PDF и читаю выбранные страницы…');
-  const task = pdfjsLib.getDocument({ data: new Uint8Array(buffer), disableFontFace: true, useSystemFonts: true });
+  const isRemoteUrl = typeof source === 'string' && /^https?:\/\//i.test(source);
+  onProgress?.(isRemoteUrl
+    ? 'Открываю PDF из Firebase Storage. Загружаю только нужные фрагменты файла…'
+    : 'Открываю PDF и читаю выбранные страницы…');
+
+  const documentOptions = isRemoteUrl
+    ? {
+        url: source,
+        disableFontFace: true,
+        useSystemFonts: true,
+        // Для больших учебников не загружаем весь PDF в память. PDF.js использует HTTP Range.
+        disableStream: true,
+        disableAutoFetch: true,
+        rangeChunkSize: 512 * 1024,
+      }
+    : {
+        data: new Uint8Array(source),
+        disableFontFace: true,
+        useSystemFonts: true,
+      };
+
+  const task = pdfjsLib.getDocument(documentOptions);
   const pdf = await task.promise;
   if (!pdf?.numPages) throw new Error('Не удалось прочитать PDF учебника.');
 
@@ -671,7 +691,7 @@ export async function obtainTextbookPagesAutomatically({
   const savedCalibration = await loadUserPageCalibration(db, user.uid, textbookId, part, sourceKey);
   let extracted;
   try {
-    extracted = await extractRequestedPagesFromPdf(pdf.buffer, missing, {
+    extracted = await extractRequestedPagesFromPdf(pdf.url || pdf.buffer, missing, {
       onProgress,
       user,
       ocrFallback: true,
