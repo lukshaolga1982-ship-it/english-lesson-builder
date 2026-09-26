@@ -312,6 +312,7 @@ export async function generateLesson(user, payload) {
     lesson: normalizeLesson(data.result, payload),
     remaining: data.remaining,
     model: data.model,
+    usageSummary: data.usageSummary || null,
   };
 }
 
@@ -347,6 +348,7 @@ export async function refineLessonStage(user, { mode, stage, previousStage, next
     stage: normalizeStage(data.result?.stage || data.result),
     remaining: data.remaining,
     model: data.model,
+    usageSummary: data.usageSummary || null,
   };
 }
 

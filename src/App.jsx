@@ -92,6 +92,43 @@ function AlternativeSection({ title, subtitle, items = [], kind, onApply }) {
   </section>;
 }
 
+function formatNumber(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—';
+  return new Intl.NumberFormat('ru-RU').format(Number(value));
+}
+
+function formatUsd(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—';
+  if (Number(value) < 0.01) return `< $0.01`;
+  return `$${Number(value).toFixed(3)}`;
+}
+
+function operationLabel(operation) {
+  if (operation === 'ocr') return 'OCR страниц';
+  if (operation === 'refine') return 'Точечная правка';
+  return 'Генерация плана';
+}
+
+function UsageSummaryCard({ usage }) {
+  if (!usage) return null;
+  return <div className="usage-card">
+    <div className="usage-head">
+      <div>
+        <span>Токены и стоимость</span>
+        <b>{operationLabel(usage.operation)}</b>
+      </div>
+      <small>{usage.model || 'Qwen'}</small>
+    </div>
+    <div className="usage-grid">
+      <div><span>Input</span><b>{formatNumber(usage.promptTokens)}</b></div>
+      <div><span>Output</span><b>{formatNumber(usage.completionTokens)}</b></div>
+      <div><span>Всего</span><b>{formatNumber(usage.totalTokens)}</b></div>
+      <div><span>Стоимость</span><b>{formatUsd(usage.estimatedCost?.total)}</b></div>
+    </div>
+    {usage.estimatedCost && <p>≈ {formatUsd(usage.estimatedCost?.input)} input + {formatUsd(usage.estimatedCost?.output)} output</p>}
+  </div>;
+}
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [step, setStep] = useState(0);
@@ -110,6 +147,7 @@ export default function App() {
   const [uploadedPageImages, setUploadedPageImages] = useState([]);
   const [uploadedPdfFile, setUploadedPdfFile] = useState(null);
   const [uploadedTextbookSource, setUploadedTextbookSource] = useState(null);
+  const [usageSummary, setUsageSummary] = useState(null);
 
   useEffect(() => onAuthStateChanged(auth, setUser), []);
   useEffect(() => {
@@ -336,6 +374,7 @@ export default function App() {
       const result = await generateLesson(user, payload);
       setLesson(result.lesson);
       setRemaining(result.remaining ?? null);
+      setUsageSummary(result.usageSummary ?? null);
       setLessonId(null);
       await saveLesson(result.lesson, true);
       setStep(3);
@@ -370,6 +409,7 @@ export default function App() {
       const next = structuredClone(lesson);
       next.stages[index] = { ...result.stage, id: current.id, name: current.name, duration: current.duration };
       setLesson(next);
+      setUsageSummary(result.usageSummary ?? null);
       await saveLesson(next);
     } catch (e) { setNotice(`Не удалось изменить этап: ${e.message}`); }
     finally { setBusy(false); }
@@ -424,7 +464,7 @@ export default function App() {
     <main className="page">
       <section className="hero">
         <div><span className="eyebrow"><Sparkles size={14}/> Для учителей Республики Беларусь</span><h1>План-конспект урока<br/><em>с методической логикой</em></h1><p>Smart Lesson выстраивает задания в последовательность, связывает этапы логическими мостиками и предлагает несколько вариантов начала, двигательной паузы и рефлексии.</p></div>
-        <div className="hero-card"><Zap/><strong>Alibaba · Qwen3.8-27B</strong><span>5 полных генераций в сутки</span>{remaining !== null && <small>Сегодня осталось: {remaining}</small>}</div>
+        <div className="hero-card"><Zap/><strong>Alibaba · Qwen3.8-27B</strong><span>5 полных генераций в сутки</span><small>Thinking mode отключён</small>{remaining !== null && <small>Сегодня осталось: {remaining}</small>}</div>
       </section>
 
       <section className="builder">
@@ -544,11 +584,13 @@ export default function App() {
             <div className="summary-long"><b>Компетенции</b><p>{form.competencies.join(', ') || 'Не выбраны'}</p><b>Функциональная грамотность</b><p>{form.literacies.join(', ') || 'Не выбрана'}</p><b>Дополнительно</b><p>{form.extras.join(', ') || 'Нет'}</p><b>Методическая логика</b><p>Цель → последовательная система упражнений → речевая кульминация → рефлексия по критериям успеха; между этапами — содержательные мостики.</p></div>
             <div className={`source-summary ${textbookSourceStatus.state || 'idle'}`}><b>Опора на учебник</b><p>{form.pages ? (textbookSourceStatus.message || `Перед генерацией будут проверены стр. ${form.pages}.`) : 'Конкретные страницы не указаны.'}</p></div>
             <button className="generate" disabled={busy} onClick={generate}>{busy ? <RefreshCw className="spin"/> : <Sparkles/>}{busy ? 'Создаю и проверяю план…' : 'Создать план-конспект'}</button>
+            <UsageSummaryCard usage={usageSummary} />
             {!user && <p className="signin-hint">Для генерации нужен вход через Google — так работают история и дневной лимит.</p>}
           </>}
 
           {step === 3 && lesson && <div className="result">
             <div className="result-toolbar"><div><span className="success"><Check size={15}/> План создан</span><h2>{lesson.title}</h2>{remaining !== null && <small>Осталось полных генераций сегодня: {remaining}</small>}</div><div className="toolbar-actions"><button className="secondary" onClick={() => saveLesson()}><Save size={17}/> Сохранить</button><button className="primary" onClick={exportDocx}><Download size={17}/> Скачать Word</button></div></div>
+            <UsageSummaryCard usage={usageSummary} />
 
             <div className="meta-editor">
               <Field label="Цель"><textarea rows={3} value={lesson.meta?.goal || ''} onChange={(e) => setLesson({ ...lesson, meta: { ...lesson.meta, goal: e.target.value } })}/></Field>

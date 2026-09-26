@@ -3,6 +3,10 @@ const PRIMARY_MODEL = "qwen3.8-27b";
 const FALLBACK_MODEL = null;
 const VISION_MODEL = "qwen3.8-27b";
 const DEFAULT_ALIBABA_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+const MODEL_PRICING = {
+  "qwen3.8-27b": { inputPerM: 0.50, outputPerM: 3.00, currency: "USD" },
+};
+
 
 const ALLOWED_ORIGINS = new Set([
   "https://lukshaolga1982-ship-it.github.io",
@@ -475,6 +479,47 @@ function alibabaErrorMessage(data, status, model) {
   return raw;
 }
 
+function extractUsageTotals(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens ?? 0) || 0;
+  const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? usage.completionTokens ?? 0) || 0;
+  const totalTokens = Number(usage.total_tokens ?? usage.totalTokens ?? (promptTokens + completionTokens)) || (promptTokens + completionTokens);
+  const reasoningTokens = Number(usage.reasoning_tokens ?? usage.reasoningTokens ?? 0) || 0;
+  return { promptTokens, completionTokens, totalTokens, reasoningTokens };
+}
+
+function getModelPricing(model) {
+  return MODEL_PRICING[String(model || "").toLowerCase()] || null;
+}
+
+function buildUsageSummary(usage, model, operation = "generate") {
+  const totals = extractUsageTotals(usage);
+  if (!totals) return null;
+  const pricing = getModelPricing(model);
+  const inputCost = pricing ? (totals.promptTokens / 1_000_000) * pricing.inputPerM : null;
+  const outputCost = pricing ? (totals.completionTokens / 1_000_000) * pricing.outputPerM : null;
+  const totalCost = inputCost != null && outputCost != null ? inputCost + outputCost : null;
+  return {
+    operation,
+    model,
+    promptTokens: totals.promptTokens,
+    completionTokens: totals.completionTokens,
+    totalTokens: totals.totalTokens,
+    reasoningTokens: totals.reasoningTokens,
+    pricing: pricing ? {
+      currency: pricing.currency || "USD",
+      inputPerM: pricing.inputPerM,
+      outputPerM: pricing.outputPerM,
+    } : null,
+    estimatedCost: totalCost != null ? {
+      currency: pricing?.currency || "USD",
+      input: Number(inputCost.toFixed(6)),
+      output: Number(outputCost.toFixed(6)),
+      total: Number(totalCost.toFixed(6)),
+    } : null,
+  };
+}
+
 async function callAlibaba(env, prompt, systemPrompt) {
   const models = [String(env.QWEN_MODEL || PRIMARY_MODEL), FALLBACK_MODEL].filter(Boolean);
   const apiKey = alibabaApiKey(env);
@@ -515,7 +560,7 @@ async function callAlibaba(env, prompt, systemPrompt) {
         lastError = new Error(`Alibaba Model Studio не вернул текст ответа для ${model}.`);
         continue;
       }
-      return { model, result: safeJsonParse(content), usage: data.usage || null };
+      return { model, result: safeJsonParse(content), usage: data.usage || null, usageSummary: buildUsageSummary(data.usage || null, model, "generate") };
     } catch (error) {
       lastError = error;
     }
@@ -571,7 +616,7 @@ async function callAlibabaVisionOcr(env, images) {
   const parsed = safeJsonParse(raw || "");
   const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
   if (!pages.length) throw new Error("Alibaba Qwen не вернул распознанные страницы.");
-  return { model, pages, usage: data.usage || null };
+  return { model, pages, usage: data.usage || null, usageSummary: buildUsageSummary(data.usage || null, model, "ocr") };
 }
 
 async function handleOcrTextbookImages(request, env, user) {
@@ -663,7 +708,8 @@ async function handleRefine(request, env, user) {
   const prompt = normalizePrompt(body);
   const alibaba = await callAlibaba(env, prompt, REFINE_SYSTEM_PROMPT);
   const next = await incrementUsage(env, user.sub, "refine");
-  return jsonResponse(request, { ok: true, ...alibaba, limit: REFINE_DAILY_LIMIT, used: next, remaining: Math.max(0, REFINE_DAILY_LIMIT - next) });
+  const usageSummary = alibaba.usageSummary ? { ...alibaba.usageSummary, operation: "refine" } : null;
+  return jsonResponse(request, { ok: true, ...alibaba, usageSummary, limit: REFINE_DAILY_LIMIT, used: next, remaining: Math.max(0, REFINE_DAILY_LIMIT - next) });
 }
 
 export default {
@@ -683,6 +729,7 @@ export default {
         fallbackModel: FALLBACK_MODEL,
         visionModel: VISION_MODEL,
         textbookImageOcr: true,
+        thinkingEnabled: false,
       });
     }
 
