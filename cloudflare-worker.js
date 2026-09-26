@@ -191,8 +191,19 @@ async function verifyFirebaseToken(token) {
 async function requireUser(request) {
   const auth = request.headers.get("Authorization") || "";
   const match = auth.match(/^Bearer\s+(.+)$/i);
-  if (!match) throw new Error("AUTH_REQUIRED");
-  return verifyFirebaseToken(match[1]);
+  if (match) return verifyFirebaseToken(match[1]);
+
+  // v17: allow the Firebase ID token in the POST body. This lets the browser
+  // use a CORS-simple text/plain request and avoids the OPTIONS preflight that
+  // can fail on some networks/browser setups. We read from a clone so route
+  // handlers can still parse the original request body normally.
+  try {
+    const body = await request.clone().json();
+    const bodyToken = String(body?.firebaseToken || "").trim();
+    if (bodyToken) return verifyFirebaseToken(bodyToken);
+  } catch {}
+
+  throw new Error("AUTH_REQUIRED");
 }
 
 function utcDateKey() {
@@ -863,8 +874,9 @@ export default {
         alibabaNativeBaseUrl: alibabaNativeBaseUrl(env),
         alibabaNativeEndpoint: alibabaNativeEndpoint(env),
         apiMode: "dashscope-native-multimodal",
-        workerVersion: "v13-network-cors",
-        corsMode: "echo-valid-https-origin",
+        workerVersion: "v17-no-preflight",
+        corsMode: "simple-post-no-preflight",
+        authTransport: "firebase-token-in-body-or-bearer",
         kvConfigured: Boolean(env.USAGE_LIMITS),
         automaticTextbooks: Object.keys(TEXTBOOK_SOURCES),
         primaryModel: PRIMARY_MODEL,

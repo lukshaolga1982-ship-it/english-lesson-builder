@@ -12,12 +12,12 @@ async function apiRequest(path, user, body) {
   try {
     const response = await fetch(`${API_BASE}${path}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(body),
+      // text/plain is a CORS-safelisted content type, so the browser does not
+      // need a preflight OPTIONS request before calling the Worker.
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify({ ...body, firebaseToken: token }),
       signal: controller.signal,
+      cache: 'no-store',
     });
 
     const data = await response.json().catch(() => ({}));
@@ -37,7 +37,7 @@ async function apiRequest(path, user, body) {
     }
     if (error instanceof TypeError && /failed to fetch/i.test(error.message || '')) {
       const origin = typeof window !== 'undefined' ? window.location.origin : 'неизвестный origin';
-      throw new Error(`Сайт не смог связаться с Cloudflare Worker (origin: ${origin}). Обновите Worker до v13 и проверьте /health.`);
+      throw new Error(`Браузер не получил ответ от Cloudflare Worker (origin: ${origin}). Проверьте /health. В версии v17 запрос идёт без CORS preflight.`);
     }
     throw error;
   } finally {

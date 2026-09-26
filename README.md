@@ -1,3 +1,7 @@
+# Smart Lesson v17 — no-preflight transport
+
+В этой версии запросы GitHub Pages → Cloudflare Worker отправляют Firebase ID token внутри тела `text/plain` POST. Это CORS-simple request и не требует предварительного `OPTIONS` запроса. Worker по-прежнему криптографически проверяет Firebase ID token.
+
 # Smart Lesson
 
 ## v14 — Firebase Storage textbook library

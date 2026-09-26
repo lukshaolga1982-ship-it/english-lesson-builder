@@ -304,12 +304,10 @@ async function authorizedFetch(user, path, body, { binary = false, timeoutMs = 1
   try {
     const response = await fetch(`${API_BASE}${path}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify({ ...body, firebaseToken: token }),
       signal: controller.signal,
+      cache: 'no-store',
     });
 
     if (!response.ok) {
