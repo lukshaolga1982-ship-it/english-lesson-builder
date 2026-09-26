@@ -7,7 +7,7 @@ async function apiRequest(path, user, body) {
 
   const token = await user.getIdToken();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 120000);
+  const timeout = setTimeout(() => controller.abort(), 240000);
 
   try {
     const response = await fetch(`${API_BASE}${path}`, {
@@ -37,7 +37,7 @@ async function apiRequest(path, user, body) {
     }
     if (error instanceof TypeError && /failed to fetch/i.test(error.message || '')) {
       const origin = typeof window !== 'undefined' ? window.location.origin : 'неизвестный origin';
-      throw new Error(`Браузер не получил ответ от Cloudflare Worker (origin: ${origin}). Проверьте /health. В версии v17 запрос идёт без CORS preflight.`);
+      throw new Error(`Браузер не получил ответ от Cloudflare Worker (origin: ${origin}). Проверьте /health. В версии v18 запрос идёт без CORS preflight и с потоковым keep-alive.`);
     }
     throw error;
   } finally {

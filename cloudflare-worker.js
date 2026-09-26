@@ -643,13 +643,17 @@ async function requestAlibabaNative(env, model, messages, maxTokens = 8000, temp
   let response;
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort("ALIBABA_TIMEOUT"), 90000);
+    const timer = setTimeout(() => controller.abort("ALIBABA_TIMEOUT"), 240000);
     try {
       response = await fetch(alibabaNativeEndpoint(env), {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${alibabaApiKey(env)}`,
           "Content-Type": "application/json",
+          // Qwen3 open-source models are designed for streaming output. Using
+          // DashScope SSE also makes long generations start returning data
+          // immediately instead of leaving the connection idle.
+          "X-DashScope-SSE": "enable",
         },
         body: JSON.stringify({
           model,
@@ -657,6 +661,7 @@ async function requestAlibabaNative(env, model, messages, maxTokens = 8000, temp
           parameters: {
             result_format: "message",
             enable_thinking: false,
+            incremental_output: true,
             temperature,
             max_tokens: maxTokens,
           },
@@ -668,20 +673,96 @@ async function requestAlibabaNative(env, model, messages, maxTokens = 8000, temp
     }
   } catch (error) {
     const suffix = error?.name === "AbortError"
-      ? "Alibaba не ответил за 90 секунд."
+      ? "Alibaba не завершил генерацию за 240 секунд."
       : (error?.message || String(error));
     const wrapped = new Error(`Не удалось связаться с Alibaba Model Studio: ${suffix}`);
     wrapped.code = "ALIBABA_NETWORK_ERROR";
     throw wrapped;
   }
-  const data = await response.json().catch(async () => ({ raw: await response.text().catch(() => "") }));
-  if (!response.ok || data?.code) {
+
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    let data = {};
+    try { data = JSON.parse(raw); } catch { data = { message: raw }; }
     const error = new Error(alibabaErrorMessage(data, response.status || 400, model));
     error.status = response.status;
     error.code = data?.code || data?.error?.code || "";
     throw error;
   }
-  return data;
+
+  if (!response.body) {
+    throw new Error("Alibaba Model Studio не вернул поток ответа.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let dataLines = [];
+  let fullContent = "";
+  let usage = null;
+  let requestId = null;
+
+  const processEvent = () => {
+    if (!dataLines.length) return;
+    const rawData = dataLines.join("\n").trim();
+    dataLines = [];
+    if (!rawData || rawData === "[DONE]") return;
+
+    let event;
+    try { event = JSON.parse(rawData); }
+    catch { return; }
+
+    if (event?.code && !event?.output) {
+      const err = new Error(alibabaErrorMessage(event, 400, model));
+      err.code = event.code;
+      throw err;
+    }
+
+    const piece = extractNativeContent(event);
+    if (piece) fullContent += piece;
+    if (event?.usage) usage = event.usage;
+    if (event?.request_id) requestId = event.request_id;
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        let line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+
+        if (line === "") {
+          processEvent();
+          continue;
+        }
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      for (let line of buffer.split(/\r?\n/)) {
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+    }
+    processEvent();
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  if (!fullContent) {
+    throw new Error("Alibaba Qwen завершил поток без текстового ответа.");
+  }
+
+  return {
+    output: { choices: [{ message: { role: "assistant", content: fullContent } }] },
+    usage,
+    request_id: requestId,
+  };
 }
 
 async function callAlibaba(env, prompt, systemPrompt) {
@@ -700,7 +781,7 @@ async function callAlibaba(env, prompt, systemPrompt) {
 
       try {
         const result = safeJsonParse(content);
-        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: false, apiMode: "dashscope-native" };
+        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: false, apiMode: "dashscope-native-sse" };
       } catch {
         const retryMessages = [
           { role: "system", content: `${systemPrompt}\nВерни ТОЛЬКО один валидный JSON-объект. Без markdown и без текста до/после JSON. Сделай формулировки компактнее, но сохрани все обязательные поля.` },
@@ -710,7 +791,7 @@ async function callAlibaba(env, prompt, systemPrompt) {
         usage = addUsage(usage, retryData.usage || null);
         content = extractNativeContent(retryData);
         const result = safeJsonParse(content);
-        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: true, apiMode: "dashscope-native" };
+        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: true, apiMode: "dashscope-native-sse" };
       }
     } catch (error) {
       lastError = error;
@@ -756,7 +837,7 @@ async function callAlibabaVisionOcr(env, images) {
   }
   const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
   if (!pages.length) throw new Error("Alibaba Qwen не вернул распознанные страницы.");
-  return { model, pages, usage, usageSummary: buildUsageSummary(usage, model, "ocr"), jsonRetry, apiMode: "dashscope-native" };
+  return { model, pages, usage, usageSummary: buildUsageSummary(usage, model, "ocr"), jsonRetry, apiMode: "dashscope-native-sse" };
 }
 
 async function handleOcrTextbookImages(request, env, user) {
@@ -852,6 +933,51 @@ async function handleRefine(request, env, user) {
   return jsonResponse(request, { ok: true, ...alibaba, usageSummary, limit: REFINE_DAILY_LIMIT, used: next, remaining: Math.max(0, REFINE_DAILY_LIMIT - next) });
 }
 
+function streamJsonHandler(request, task) {
+  const encoder = new TextEncoder();
+  let timer = null;
+  const stream = new ReadableStream({
+    async start(controller) {
+      // Send response headers/body immediately. Whitespace before JSON is valid
+      // JSON input for response.json(), while also preventing 30-second idle
+      // connection timeouts between the browser and Cloudflare.
+      try { controller.enqueue(encoder.encode("\n")); } catch {}
+      timer = setInterval(() => {
+        try { controller.enqueue(encoder.encode(" \n")); } catch {}
+      }, 10000);
+
+      try {
+        const response = await task();
+        const body = await response.text();
+        controller.enqueue(encoder.encode(body));
+      } catch (error) {
+        console.error("Smart Lesson streamed task error:", error);
+        controller.enqueue(encoder.encode(JSON.stringify({
+          ok: false,
+          error: "SERVER_ERROR",
+          message: error?.message || "Неизвестная ошибка сервера.",
+        })));
+      } finally {
+        if (timer) clearInterval(timer);
+        try { controller.close(); } catch {}
+      }
+    },
+    cancel() {
+      if (timer) clearInterval(timer);
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Accel-Buffering": "no",
+      ...corsHeaders(request),
+    },
+  });
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -874,9 +1000,11 @@ export default {
         alibabaNativeBaseUrl: alibabaNativeBaseUrl(env),
         alibabaNativeEndpoint: alibabaNativeEndpoint(env),
         apiMode: "dashscope-native-multimodal",
-        workerVersion: "v17-no-preflight",
+        workerVersion: "v18-sse-heartbeat",
         corsMode: "simple-post-no-preflight",
         authTransport: "firebase-token-in-body-or-bearer",
+        alibabaTransport: "dashscope-sse",
+        clientKeepalive: "streamed-whitespace-heartbeat-10s",
         kvConfigured: Boolean(env.USAGE_LIMITS),
         automaticTextbooks: Object.keys(TEXTBOOK_SOURCES),
         primaryModel: PRIMARY_MODEL,
@@ -905,10 +1033,10 @@ export default {
       if (url.pathname === "/textbook-pdf") return await handleTextbookPdf(request, env, user);
 
       if (!alibabaApiKey(env)) return jsonResponse(request, { ok: false, error: "ALIBABA_NOT_CONFIGURED", message: "В Worker не найден секрет DASHSCOPE_API_KEY." }, 500);
-      if (url.pathname === "/ocr-textbook-images") return await handleOcrTextbookImages(request, env, user);
+      if (url.pathname === "/ocr-textbook-images") return streamJsonHandler(request, () => handleOcrTextbookImages(request, env, user));
 
-      if (url.pathname === "/generate") return await handleGenerate(request, env, user);
-      if (url.pathname === "/refine") return await handleRefine(request, env, user);
+      if (url.pathname === "/generate") return streamJsonHandler(request, () => handleGenerate(request, env, user));
+      if (url.pathname === "/refine") return streamJsonHandler(request, () => handleRefine(request, env, user));
       return jsonResponse(request, { ok: false, error: "NOT_FOUND" }, 404);
     } catch (error) {
       console.error("Smart Lesson API error:", error);
