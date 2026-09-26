@@ -2,7 +2,7 @@ const FIREBASE_PROJECT_ID = "english-lesson-builder";
 const PRIMARY_MODEL = "qwen3.8-27b";
 const FALLBACK_MODEL = null;
 const VISION_MODEL = "qwen3.8-27b";
-const DEFAULT_ALIBABA_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+const DEFAULT_ALIBABA_NATIVE_BASE_URL = "https://dashscope-intl.aliyuncs.com/api/v1";
 const MODEL_PRICING = {
   "qwen3.8-27b": { inputPerM: 0.50, outputPerM: 3.00, currency: "USD" },
 };
@@ -507,8 +507,24 @@ function addUsage(a, b) {
   return Object.keys(out).length ? out : (b || a || null);
 }
 
-function alibabaBaseUrl(env) {
-  return String(env.ALIBABA_BASE_URL || DEFAULT_ALIBABA_BASE_URL).replace(/\/+$/, "");
+function alibabaNativeBaseUrl(env) {
+  const configured = String(env.ALIBABA_NATIVE_BASE_URL || env.ALIBABA_WORKSPACE_BASE_URL || "").trim();
+  if (configured) return configured.replace(/\/+$/, "");
+
+  // Backward compatibility: if the old compatible-mode URL is still configured,
+  // convert it to the native DashScope base instead of using /chat/completions.
+  const legacy = String(env.ALIBABA_BASE_URL || "").trim();
+  if (legacy) {
+    try {
+      const url = new URL(legacy);
+      return `${url.origin}/api/v1`;
+    } catch {}
+  }
+  return DEFAULT_ALIBABA_NATIVE_BASE_URL;
+}
+
+function alibabaNativeEndpoint(env) {
+  return `${alibabaNativeBaseUrl(env)}/services/aigc/multimodal-generation/generation`;
 }
 
 function alibabaApiKey(env) {
@@ -516,9 +532,9 @@ function alibabaApiKey(env) {
 }
 
 function alibabaErrorMessage(data, status, model) {
-  const raw = data?.error?.message || data?.message || `Alibaba Model Studio вернул HTTP ${status} для ${model}`;
+  const raw = data?.message || data?.error?.message || data?.code || `Alibaba Model Studio вернул HTTP ${status} для ${model}`;
   if (status === 401 || status === 403) {
-    return `Alibaba Model Studio отклонил API key. Проверьте DASHSCOPE_API_KEY и регион ключа/ALIBABA_BASE_URL. ${raw}`;
+    return `Alibaba Model Studio отклонил API key. Проверьте DASHSCOPE_API_KEY и регион ключа. ${raw}`;
   }
   if (status === 429) {
     return `Alibaba Model Studio временно ограничил частоту запросов. Попробуйте ещё раз через минуту. ${raw}`;
@@ -567,8 +583,38 @@ function buildUsageSummary(usage, model, operation = "generate") {
   };
 }
 
-async function requestAlibabaText(env, model, messages, maxTokens = 8000) {
-  const response = await fetch(`${alibabaBaseUrl(env)}/chat/completions`, {
+function normalizeNativeMessage(message) {
+  const role = message?.role || "user";
+  const content = message?.content;
+  if (Array.isArray(content)) {
+    return {
+      role,
+      content: content.map((item) => {
+        if (item?.image) return { image: item.image };
+        if (item?.image_url?.url) return { image: item.image_url.url };
+        if (item?.text != null) return { text: String(item.text) };
+        if (item?.type === "text" && item?.text != null) return { text: String(item.text) };
+        return { text: String(item ?? "") };
+      }),
+    };
+  }
+  return { role, content: [{ text: String(content ?? "") }] };
+}
+
+function extractNativeContent(data) {
+  const content = data?.output?.choices?.[0]?.message?.content ?? data?.output?.text ?? "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((item) => {
+      if (typeof item === "string") return item;
+      return item?.text ?? item?.content ?? "";
+    }).filter(Boolean).join("\n");
+  }
+  return String(content || "");
+}
+
+async function requestAlibabaNative(env, model, messages, maxTokens = 8000, temperature = 0.2) {
+  const response = await fetch(alibabaNativeEndpoint(env), {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${alibabaApiKey(env)}`,
@@ -576,17 +622,20 @@ async function requestAlibabaText(env, model, messages, maxTokens = 8000) {
     },
     body: JSON.stringify({
       model,
-      messages,
-      enable_thinking: false,
-      temperature: 0.2,
-      max_tokens: maxTokens,
+      input: { messages: messages.map(normalizeNativeMessage) },
+      parameters: {
+        result_format: "message",
+        enable_thinking: false,
+        temperature,
+        max_tokens: maxTokens,
+      },
     }),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(alibabaErrorMessage(data, response.status, model));
+  if (!response.ok || data?.code) {
+    const error = new Error(alibabaErrorMessage(data, response.status || 400, model));
     error.status = response.status;
-    error.code = data?.error?.code || data?.code || data?.error?.type || "";
+    error.code = data?.code || data?.error?.code || "";
     throw error;
   }
   return data;
@@ -602,25 +651,23 @@ async function callAlibaba(env, prompt, systemPrompt) {
         { role: "system", content: `${systemPrompt}\nВАЖНО: ответ должен быть одним валидным JSON-объектом. Не используй markdown-кодовые блоки и текст вне JSON.` },
         { role: "user", content: prompt },
       ];
-      let data = await requestAlibabaText(env, model, messages, 8000);
+      let data = await requestAlibabaNative(env, model, messages, 8000, 0.2);
       let usage = data.usage || null;
-      let content = data?.choices?.[0]?.message?.content || "";
+      let content = extractNativeContent(data);
 
       try {
         const result = safeJsonParse(content);
-        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: false };
-      } catch (parseError) {
-        // One automatic retry without response_format. Asking for a shorter regeneration is
-        // more reliable than Alibaba json_object mode for large nested lesson plans.
+        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: false, apiMode: "dashscope-native" };
+      } catch {
         const retryMessages = [
           { role: "system", content: `${systemPrompt}\nВерни ТОЛЬКО один валидный JSON-объект. Без markdown и без текста до/после JSON. Сделай формулировки компактнее, но сохрани все обязательные поля.` },
           { role: "user", content: `${prompt}\n\nПРЕДЫДУЩАЯ ПОПЫТКА НЕ ПРОШЛА JSON-ПРОВЕРКУ. Сгенерируй ответ заново целиком, короче и обязательно закрой все массивы/объекты.` },
         ];
-        const retryData = await requestAlibabaText(env, model, retryMessages, 8000);
+        const retryData = await requestAlibabaNative(env, model, retryMessages, 8000, 0.1);
         usage = addUsage(usage, retryData.usage || null);
-        content = retryData?.choices?.[0]?.message?.content || "";
+        content = extractNativeContent(retryData);
         const result = safeJsonParse(content);
-        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: true };
+        return { model, result, usage, usageSummary: buildUsageSummary(usage, model, "generate"), jsonRetry: true, apiMode: "dashscope-native" };
       }
     } catch (error) {
       lastError = error;
@@ -631,7 +678,6 @@ async function callAlibaba(env, prompt, systemPrompt) {
 
 async function callAlibabaVisionOcr(env, images) {
   const content = [{
-    type: "text",
     text: `Ты выполняешь точное распознавание страниц школьного учебника английского языка.
 Для каждого изображения перепиши ВСЁ учебно значимое содержимое максимально близко к оригиналу:
 - заголовки, номера и формулировки упражнений;
@@ -645,30 +691,29 @@ async function callAlibabaVisionOcr(env, images) {
   }];
 
   for (const image of images) {
-    content.push({ type: "text", text: `Метка следующего изображения: ${String(image.label || "страница").slice(0, 120)}` });
-    content.push({ type: "image_url", image_url: { url: image.dataUrl } });
+    content.push({ text: `Метка следующего изображения: ${String(image.label || "страница").slice(0, 120)}` });
+    content.push({ image: image.dataUrl });
   }
 
   const model = String(env.QWEN_VISION_MODEL || env.QWEN_MODEL || VISION_MODEL);
-  const messages = [{ role: "user", content }];
-  let data = await requestAlibabaText(env, model, messages, 8000);
+  let data = await requestAlibabaNative(env, model, [{ role: "user", content }], 8000, 0.1);
   let usage = data.usage || null;
-  let raw = data?.choices?.[0]?.message?.content || "";
+  let raw = extractNativeContent(data);
   let parsed;
   let jsonRetry = false;
   try {
     parsed = safeJsonParse(raw);
   } catch {
     jsonRetry = true;
-    const retryContent = [...content, { type: "text", text: "Предыдущий ответ был невалидным JSON. Повтори распознавание и верни только один корректно закрытый JSON-объект без markdown." }];
-    const retryData = await requestAlibabaText(env, model, [{ role: "user", content: retryContent }], 8000);
+    const retryContent = [...content, { text: "Предыдущий ответ был невалидным JSON. Повтори распознавание и верни только один корректно закрытый JSON-объект без markdown." }];
+    const retryData = await requestAlibabaNative(env, model, [{ role: "user", content: retryContent }], 8000, 0.05);
     usage = addUsage(usage, retryData.usage || null);
-    raw = retryData?.choices?.[0]?.message?.content || "";
+    raw = extractNativeContent(retryData);
     parsed = safeJsonParse(raw);
   }
   const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
   if (!pages.length) throw new Error("Alibaba Qwen не вернул распознанные страницы.");
-  return { model, pages, usage, usageSummary: buildUsageSummary(usage, model, "ocr"), jsonRetry };
+  return { model, pages, usage, usageSummary: buildUsageSummary(usage, model, "ocr"), jsonRetry, apiMode: "dashscope-native" };
 }
 
 async function handleOcrTextbookImages(request, env, user) {
@@ -774,7 +819,9 @@ export default {
         ok: true,
         service: "Smart Lesson API",
         alibabaConfigured: Boolean(alibabaApiKey(env)),
-        alibabaBaseUrl: alibabaBaseUrl(env),
+        alibabaNativeBaseUrl: alibabaNativeBaseUrl(env),
+        alibabaNativeEndpoint: alibabaNativeEndpoint(env),
+        apiMode: "dashscope-native-multimodal",
         kvConfigured: Boolean(env.USAGE_LIMITS),
         automaticTextbooks: Object.keys(TEXTBOOK_SOURCES),
         primaryModel: PRIMARY_MODEL,

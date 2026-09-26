@@ -12,7 +12,7 @@
 DASHSCOPE_API_KEY
 ```
 
-По умолчанию используется международный Singapore endpoint `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. При необходимости можно задать `ALIBABA_BASE_URL` отдельно. Подробная настройка: [`ALIBABA-SETUP.md`](./ALIBABA-SETUP.md).
+По умолчанию используется нативный Singapore DashScope API `https://dashscope-intl.aliyuncs.com/api/v1` и endpoint `multimodal-generation/generation`. OpenAI-compatible `/chat/completions` больше не используется. При необходимости можно задать `ALIBABA_NATIVE_BASE_URL`. Подробная настройка: [`ALIBABA-SETUP.md`](./ALIBABA-SETUP.md).
 
 
 ## Версия 0.5 — автоматическая работа со страницами учебника
@@ -263,3 +263,11 @@ Alibaba Model Studio тарифицируется отдельно. Для API �
 - Worker самостоятельно извлекает и валидирует JSON-объект.
 - Если JSON оборвался или не парсится, Worker автоматически повторяет генерацию один раз с более жёсткой и компактной инструкцией.
 - OCR фото страниц использует ту же схему проверки и автоматического повтора.
+
+
+### v12 — native DashScope fix
+- Убран OpenAI-compatible endpoint `/chat/completions`.
+- Полностью отсутствует `response_format`.
+- Генерация и OCR работают через нативный DashScope multimodal API.
+- JSON проверяет Worker; при невалидном JSON выполняется одна автоматическая повторная генерация.
+- `/health` должен показывать `"apiMode":"dashscope-native-multimodal"`.

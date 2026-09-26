@@ -47,7 +47,7 @@ Value: ваш API key Alibaba Model Studio
 По умолчанию Worker использует Singapore DashScope endpoint:
 
 ```text
-https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+https://dashscope-intl.aliyuncs.com/api/v1
 ```
 
 Поэтому при Singapore API key дополнительная переменная обычно не нужна.
@@ -55,8 +55,8 @@ https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 Если Model Studio при создании ключа показывает workspace-specific API Host, можно использовать его. В Cloudflare добавьте обычную переменную:
 
 ```text
-Name: ALIBABA_BASE_URL
-Value: https://ВАШ_WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+Name: ALIBABA_NATIVE_BASE_URL
+Value: https://ВАШ_WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/api/v1
 ```
 
 Важно: API key и Base URL должны относиться к одному региону. Ключи Model Studio между регионами не взаимозаменяемы.
@@ -129,3 +129,8 @@ https://ВАШ-WORKER.workers.dev/health
 ## Старые секреты
 
 После успешной проверки v0.9 старые `OPENAI_API_KEY` и `GROQ_API_KEY` Worker больше не использует. Их можно удалить из Cloudflare, если они нигде больше не нужны.
+
+
+## v12: native DashScope API
+
+В версии v12 генерация и OCR идут через нативный endpoint `.../api/v1/services/aigc/multimodal-generation/generation`, а не через OpenAI-compatible `/chat/completions`. Это полностью исключает параметр `response_format` из запросов. Старую переменную `ALIBABA_BASE_URL`, если она уже есть в Cloudflare, можно оставить: Worker использует только её домен и автоматически переходит на `/api/v1`. Новая переменная не обязательна.
